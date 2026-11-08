@@ -55,6 +55,8 @@ class AgentRunner(ReasoningRunner):
         agent_loop: AgentLoopWorker,
         tool_workers: dict[ToolWorker, ToolWorkerInfo] = {},
         solid_rollouts: dict[str, Union["SGLangWorker", "VLLMWorker"]] = {},
+        *,
+        teacher_runtime=None,
     ):
         super().__init__(
             cfg,
@@ -65,6 +67,7 @@ class AgentRunner(ReasoningRunner):
             inference,
             actor,
             reward,
+            teacher_runtime=teacher_runtime,
         )
         all_tool_calls = list(
             itertools.chain(

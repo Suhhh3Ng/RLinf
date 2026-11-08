@@ -24,6 +24,7 @@ from torch.utils.data import Dataset, RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
+from rlinf.algorithms.distillation.config import build_distillation_plan
 from rlinf.data.schema.reasoning_requests import build_rollout_requests_from_batch
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
@@ -70,8 +71,12 @@ class ReasoningRunner:
             Union["MegatronCriticInference", "FSDPInference"]
         ] = None,
         critic: Optional["MegatronCritic"] = None,
+        *,
+        teacher_runtime=None,
     ):
         self.cfg = cfg
+        self.distillation_plan = build_distillation_plan(cfg)
+        self.teacher_runtime = teacher_runtime
         self.component_placement = placement
         self.is_pipeline = self.component_placement.is_pipeline
         self.has_dedicated_actor_inference = actor_inference is not None
@@ -136,7 +141,11 @@ class ReasoningRunner:
             self.cfg.algorithm.kl_beta > 0
             or self.cfg.algorithm.get("reinpp_kl_beta", 0) > 0
         )
-        self.recompute_logprobs = self.cfg.algorithm.recompute_logprobs
+        self.recompute_logprobs = self.cfg.algorithm.recompute_logprobs and (
+            not self.distillation_plan.enabled
+            or self.distillation_plan.need_old_logprobs
+            or self.compute_ref_logprobs
+        )
         self.consumed_samples = 0
         self.global_steps = 0
 
@@ -434,6 +443,12 @@ class ReasoningRunner:
             self.dataloader_channel.put(request, async_op=True)
 
     def _sync_weights(self):
+        if self.teacher_runtime is not None:
+            endpoints = self.teacher_runtime.endpoints
+            scorer = getattr(self, "agent_loop", self.rollout)
+            scorer.configure_teacher(endpoints, str(self.global_steps)).wait()
+            self.actor.configure_teacher(endpoints, str(self.global_steps)).wait()
+
         if self.has_dedicated_actor_inference:
             self.actor.sync_model_to_inference()
             self.actor_inference.sync_model_from_actor().wait()
@@ -451,6 +466,16 @@ class ReasoningRunner:
         # mirrors the offload condition — pure disaggregated never offloads them.
         if self.component_placement.is_collocated or self.component_placement.is_auto:
             self.rollout.onload_kv_cudagraph().wait()
+
+    def close_teacher_clients(self):
+        """Best-effort cleanup that preserves any original training exception."""
+        if self.teacher_runtime is None:
+            return
+        worker = getattr(self, "agent_loop", self.rollout)
+        try:
+            worker.close_teacher().wait()
+        except Exception:
+            logging.exception("Failed to close Teacher client connections")
 
     def _stop_rollouts(self):
         """Stop rollout engines after the training loop finishes normally.
@@ -498,10 +523,14 @@ class ReasoningRunner:
                     )
 
                     # Rewards
-                    reward_handle: Handle = self.reward.compute_rewards(
-                        input_channel=self.rollout_channel,
-                        output_channel=self.reward_channel,
-                    )
+                    if self.distillation_plan.enabled:
+                        rollout_handle.wait()
+                    reward_handle = None
+                    if self.reward is not None:
+                        reward_handle = self.reward.compute_rewards(
+                            input_channel=self.rollout_channel,
+                            output_channel=self.reward_channel,
+                        )
 
                     if self.recompute_logprobs:
                         # Inference prev/ref logprobs
@@ -605,7 +634,11 @@ class ReasoningRunner:
                     # the rollout worker may still be offloading its engine
                     # after the training result is consumed, and stopping
                     # the rollout engines first would abort that offload.
-                    reward_duration = reward_handle.consume_duration()
+                    reward_duration = (
+                        reward_handle.consume_duration()
+                        if reward_handle is not None
+                        else 0.0
+                    )
                     rollout_duration = rollout_handle.consume_duration()
                     actor_training_duration = actor_handle.consume_duration()
                     if actor_infer_handle is not None:

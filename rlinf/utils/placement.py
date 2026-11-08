@@ -1342,3 +1342,62 @@ class MultiAgentModelParallelEvalComponentPlacement(
         )
         logging.info(f"{component_name}: {component_placement_strategy}")
         return component_placement_strategy
+
+
+class TeacherComponentPlacement(ComponentPlacement):
+    """Allocate independent, same-node replicas of a frozen Teacher."""
+
+    def __init__(self, config: DictConfig, cluster: Cluster):
+        super().__init__(config, cluster)
+        self._teacher_replicas = {}
+        for value in config.cluster.component_placement.values():
+            if isinstance(value, DictConfig) and value.get("node_group") is not None:
+                raise ValueError(
+                    "Teacher placement currently requires global accelerator ranks without node_group aliases"
+                )
+        for key, model in config.distillation.teacher_models.items():
+            component = f"teacher_{key}"
+            if component not in self.components:
+                raise ValueError(f"Missing placement for {component}")
+            ranks = sorted(self.get_hardware_ranks(component))
+            width = model.inference.get(
+                "tensor_parallel_size", 1
+            ) * model.inference.get("pipeline_parallel_size", 1)
+            count = model.get("num_replicas", 1)
+            if len(ranks) != width * count:
+                raise ValueError(
+                    f"{component}: expected {width * count} GPUs, got {len(ranks)}"
+                )
+            self._teacher_replicas[key] = [
+                tuple(ranks[i * width : (i + 1) * width]) for i in range(count)
+            ]
+        self.validate_disjoint(self)
+
+    def get_replicas(self, teacher_key: str) -> list[tuple[int, ...]]:
+        """Return the immutable device allocation of each replica."""
+        return list(self._teacher_replicas[teacher_key])
+
+    def get_strategy(self, teacher_key: str, replica_id: int = 0):
+        """Place one service process on all devices of one replica."""
+        return FlexiblePlacementStrategy(
+            [list(self._teacher_replicas[teacher_key][replica_id])]
+        )
+
+    def validate_disjoint(self, student_components: ComponentPlacement) -> None:
+        """Reject any Student allocation that overlaps frozen Teacher devices."""
+        teacher_ranks = {
+            rank
+            for replicas in self._teacher_replicas.values()
+            for replica in replicas
+            for rank in replica
+        }
+        for component in student_components.components:
+            if component.startswith("teacher_"):
+                continue
+            overlap = teacher_ranks.intersection(
+                student_components.get_hardware_ranks(component)
+            )
+            if overlap:
+                raise ValueError(
+                    f"Teacher GPUs overlap {component}: {sorted(overlap)}; use explicit disjoint GPU ranges instead of all"
+                )

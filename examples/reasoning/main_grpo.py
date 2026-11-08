@@ -18,6 +18,7 @@ import hydra
 import torch.multiprocessing as mp
 from omegaconf.omegaconf import OmegaConf
 
+from rlinf.algorithms.distillation.config import build_distillation_plan
 from rlinf.config import validate_cfg
 from rlinf.data.datasets.reasoning import create_reasoning_datasets
 from rlinf.data.datasets.vlm import VLM_DATA_TYPE, create_vlm_datasets
@@ -25,13 +26,18 @@ from rlinf.models.tokenization.hf import hf_tokenizer
 from rlinf.runners.reasoning_runner import ReasoningRunner
 from rlinf.scheduler import Cluster, NodePlacementStrategy
 from rlinf.scheduler.dynamic_scheduler.scheduler_worker import SchedulerWorker
-from rlinf.utils.placement import ModelParallelComponentPlacement, PlacementMode
+from rlinf.utils.placement import (
+    ModelParallelComponentPlacement,
+    PlacementMode,
+    TeacherComponentPlacement,
+)
 from rlinf.utils.utils import output_redirector
 from rlinf.workers.actor import get_actor_worker
 from rlinf.workers.critic import get_critic_worker
 from rlinf.workers.inference.utils import get_inference_backend_worker
 from rlinf.workers.reward.reward_worker import RewardWorker
 from rlinf.workers.rollout.utils import get_rollout_backend_worker
+from rlinf.workers.teacher.runtime import launch_teacher_workers
 
 """Script to start GRPO training"""
 mp.set_start_method("spawn", force=True)
@@ -93,13 +99,15 @@ def main(cfg) -> None:
             placement_strategy=inference_placement_strategy,
         )
 
-    # Reward group
-    reward_placement_strategy = component_placement.get_strategy("reward")
-    reward_group = RewardWorker.create_group(cfg).launch(
-        cluster,
-        name=cfg.reward.group_name,
-        placement_strategy=reward_placement_strategy,
-    )
+    reward_group = None
+    if build_distillation_plan(cfg).need_task_rewards:
+        # Reward group
+        reward_placement_strategy = component_placement.get_strategy("reward")
+        reward_group = RewardWorker.create_group(cfg).launch(
+            cluster,
+            name=cfg.reward.group_name,
+            placement_strategy=reward_placement_strategy,
+        )
 
     # GRPO Actor group
     actor_worker_cls = get_actor_worker(cfg)
@@ -139,8 +147,15 @@ def main(cfg) -> None:
     else:
         train_ds, val_ds = create_reasoning_datasets(cfg, tokenizer)
 
+    teacher_runtime = None
+    if build_distillation_plan(cfg).enabled:
+        teacher_placement = TeacherComponentPlacement(cfg, cluster)
+        teacher_placement.validate_disjoint(component_placement)
+        teacher_runtime = launch_teacher_workers(cfg, cluster, teacher_placement)
+
     runner = ReasoningRunner(
         cfg=cfg,
+        teacher_runtime=teacher_runtime,
         placement=component_placement,
         train_dataset=train_ds,
         val_dataset=val_ds,
@@ -154,8 +169,13 @@ def main(cfg) -> None:
         critic=critic_group,
     )
 
-    runner.init_workers()
-    runner.run()
+    try:
+        runner.init_workers()
+        runner.run()
+    finally:
+        if teacher_runtime is not None:
+            runner.close_teacher_clients()
+            teacher_runtime.close()
 
 
 if __name__ == "__main__":

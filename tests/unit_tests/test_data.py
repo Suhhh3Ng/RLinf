@@ -3674,3 +3674,82 @@ def test_reward_loaders_accept_one_batch_per_rank(tmp_path):
 
     assert len(train_loader) == 1
     assert len(val_loader) == 1
+
+
+def test_teacher_targets_survive_rollout_split_merge():
+    from rlinf.data.schema.distillation import TeacherTargets
+    from rlinf.data.schema.reasoning_results import DynamicRolloutResult, RolloutResult
+
+    target = TeacherTargets(
+        request_id="request",
+        teacher_key="default",
+        model_fingerprint="model",
+        target_format="sampled",
+        student_policy_version=None,
+        token_ids=torch.tensor([[0], [3], [2]]),
+        logprobs=torch.tensor([[0.0], [-1.5], [-2.0]]),
+        valid_mask=torch.tensor([False, True, True]),
+    )
+    ordinary = RolloutResult(
+        num_sequence=2,
+        group_size=1,
+        prompt_lengths=[1, 1],
+        prompt_ids=[[1], [1]],
+        response_lengths=[2, 2],
+        response_ids=[[3, 2], [3, 2]],
+        is_end=[True, True],
+        teacher_targets=[target, target],
+    )
+    merged = RolloutResult.merge_result_list(RolloutResult.split_results(ordinary, 2))
+    assert len(merged.teacher_targets) == 2
+    for result in RolloutResult._split_single_result_by_group(merged):
+        torch.testing.assert_close(result.teacher_targets[0].logprobs, target.logprobs)
+    dynamic = DynamicRolloutResult(
+        num_sequence=2,
+        group_size=1,
+        idx_to_traj=[0, 0],
+        input_ids=[[1, 3, 2], [1, 3, 2]],
+        prompt_lengths=[1, 1],
+        response_lengths=[2, 2],
+        is_end=[True, True],
+        teacher_targets=[target, target],
+    )
+    merged_dynamic = DynamicRolloutResult.merge_result_list(
+        DynamicRolloutResult.split_results(dynamic, [1, 1])
+    )
+    assert merged_dynamic.rewards is None
+    assert len(merged_dynamic.teacher_targets) == 2
+
+
+def test_teacher_targets_packing_copies_disjoint_spans():
+    from rlinf.data.schema.reasoning_results import DynamicRolloutResult
+
+    batch = {
+        "idx_to_traj": [0, 0],
+        "input_ids": torch.tensor([[1, 2, 3, 0, 0], [1, 2, 3, 4, 5]]),
+        "prompt_lengths": torch.tensor([1, 3]),
+        "response_lengths": torch.tensor([2, 2]),
+        "response_mask": torch.tensor(
+            [[False, True, True, False, False], [False, False, False, True, True]]
+        ),
+        "loss_scales": torch.ones(2, 5),
+        "teacher_token_ids": torch.tensor(
+            [[[0], [7], [8], [0], [0]], [[0], [0], [0], [9], [10]]]
+        ),
+        "teacher_logprobs": torch.tensor(
+            [
+                [[0.0], [-1.0], [-2.0], [0.0], [0.0]],
+                [[0.0], [0.0], [0.0], [-3.0], [-4.0]],
+            ]
+        ),
+        "teacher_valid_mask": torch.tensor(
+            [[False, True, True, False, False], [False, False, False, True, True]]
+        ),
+    }
+    packed = DynamicRolloutResult.pack_traj_batch({"folding_scale": []}, batch)
+    assert packed["teacher_token_ids"].tolist() == [[[0], [7], [8], [9], [10]]]
+    torch.testing.assert_close(
+        packed["teacher_logprobs"],
+        torch.tensor([[[0.0], [-1.0], [-2.0], [-3.0], [-4.0]]]),
+    )
+    assert packed["teacher_valid_mask"].tolist() == [[False, True, True, True, True]]

@@ -157,6 +157,8 @@ class SeqGroupInfo:
     results: list[Optional[Union[dict, "VllmRequestOutput"]]] = field(
         init=False, compare=False
     )
+    teacher_targets: list | None = None
+    teacher_requests: list | None = None
     image_data: Optional[list] = None
     multi_modal_inputs: Optional[dict] = None
 

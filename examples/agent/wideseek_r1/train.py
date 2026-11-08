@@ -21,6 +21,7 @@ from omegaconf.omegaconf import OmegaConf
 
 from rlinf.agents.wideseek_r1.tools import WideSeekR1ToolWorker
 from rlinf.agents.wideseek_r1.wideseek_r1 import WideSeekR1AgentLoopWorker
+from rlinf.algorithms.distillation.config import build_distillation_plan
 from rlinf.config import validate_cfg
 from rlinf.data.datasets.reasoning import create_reasoning_datasets
 from rlinf.models.tokenization.hf import hf_tokenizer
@@ -29,11 +30,13 @@ from rlinf.scheduler import Cluster, NodePlacementStrategy, PackedPlacementStrat
 from rlinf.utils.placement import (
     MultiAgentModelParallelComponentPlacement,
     PlacementMode,
+    TeacherComponentPlacement,
 )
 from rlinf.utils.utils import output_redirector
-from rlinf.workers.actor.ma_megatron_actor_worker import MAMegatronActor
+from rlinf.workers.actor import get_ma_actor_worker
 from rlinf.workers.agent.tool_worker import ToolWorkerInfo
 from rlinf.workers.rollout.utils import get_rollout_backend_worker
+from rlinf.workers.teacher.runtime import launch_teacher_workers
 
 """Script to start GRPO training"""
 mp.set_start_method("spawn", force=True)
@@ -106,8 +109,14 @@ def main(cfg) -> None:
 
     # GRPO Actor group
     actor_placement_strategy = component_placement.get_strategy("actor")
-    actor_group = MAMegatronActor.create_group(cfg, component_placement).launch(
-        cluster, name=cfg.actor.group_name, placement_strategy=actor_placement_strategy
+    actor_group = (
+        get_ma_actor_worker(cfg)
+        .create_group(cfg, component_placement)
+        .launch(
+            cluster,
+            name=cfg.actor.group_name,
+            placement_strategy=actor_placement_strategy,
+        )
     )
 
     # Dataset
@@ -131,8 +140,15 @@ def main(cfg) -> None:
         ): ToolWorkerInfo(tool_names=["access"], has_session=False),
     }
 
+    teacher_runtime = None
+    if build_distillation_plan(cfg).enabled:
+        teacher_placement = TeacherComponentPlacement(cfg, cluster)
+        teacher_placement.validate_disjoint(component_placement)
+        teacher_runtime = launch_teacher_workers(cfg, cluster, teacher_placement)
+
     runner = AgentRunner(
         cfg=cfg,
+        teacher_runtime=teacher_runtime,
         placement=component_placement,
         train_dataset=train_ds,
         val_dataset=val_ds,
@@ -145,8 +161,13 @@ def main(cfg) -> None:
         reward=None,
     )
 
-    runner.init_workers()
-    runner.run()
+    try:
+        runner.init_workers()
+        runner.run()
+    finally:
+        if teacher_runtime is not None:
+            runner.close_teacher_clients()
+            teacher_runtime.close()
 
 
 if __name__ == "__main__":

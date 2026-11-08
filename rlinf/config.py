@@ -1844,7 +1844,14 @@ def _validate_steam_ensemble_cfg(actor_cfg: DictConfig) -> None:
 
 
 def validate_reasoning_cfg(cfg: DictConfig) -> DictConfig:
-    assert cfg.algorithm.recompute_logprobs or cfg.rollout.return_logprobs, (
+    from rlinf.algorithms.distillation.config import build_distillation_plan
+
+    plan = build_distillation_plan(cfg)
+    assert (
+        not plan.need_old_logprobs
+        or cfg.algorithm.recompute_logprobs
+        or cfg.rollout.return_logprobs
+    ), (
         "One of `algorithm.recompute_logprobs` or `rollout.return_logprobs` must be True to compute `prev_logprobs`."
     )
 
@@ -1902,8 +1909,16 @@ def validate_searchr1_cfg(cfg: DictConfig) -> DictConfig:
             "SearchR1 with the FSDP multi-agent actor does not support "
             "algorithm.importance_sampling_fix=True."
         )
-    expect_rollout_logprobs = not cfg.algorithm.recompute_logprobs
-    if cfg.rollout.get("return_logprobs", False) != expect_rollout_logprobs:
+    from rlinf.algorithms.distillation.config import build_distillation_plan
+
+    plan = build_distillation_plan(cfg)
+    expect_rollout_logprobs = (
+        plan.need_old_logprobs and not cfg.algorithm.recompute_logprobs
+    )
+    if (
+        plan.need_old_logprobs
+        and cfg.rollout.get("return_logprobs", False) != expect_rollout_logprobs
+    ):
         raise ValueError(
             "SearchR1 requires rollout.return_logprobs == "
             "not algorithm.recompute_logprobs "
@@ -2043,6 +2058,9 @@ def adv_requires_group_baseline(
 
 
 def validate_cfg(cfg: DictConfig) -> DictConfig:
+    from rlinf.algorithms.distillation.config import validate_distillation_cfg
+
+    distillation_plan = validate_distillation_cfg(cfg)
     OmegaConf.set_struct(cfg, True)
 
     with open_dict(cfg):
@@ -2107,7 +2125,7 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
         cfg = validate_offline_cfg(cfg)
 
     if cfg.runner.task_type != "sft" and not cfg.runner.get("only_eval", False):
-        if adv_requires_group_baseline(
+        if distillation_plan.need_task_advantages and adv_requires_group_baseline(
             cfg.algorithm.adv_type,
             cfg.algorithm.get("use_reinpp_baseline", False),
         ):

@@ -20,32 +20,26 @@ from omegaconf.omegaconf import OmegaConf
 
 from rlinf.agents.searchr1.search_tool_worker import SearchToolWorker
 from rlinf.agents.searchr1.searchr1_agent_loop import Searchr1AgentLoopWorker
+from rlinf.algorithms.distillation.config import build_distillation_plan
 from rlinf.config import validate_cfg
 from rlinf.data.datasets.reasoning import create_reasoning_datasets
 from rlinf.models.tokenization.hf import hf_tokenizer
 from rlinf.runners.agent_runner import AgentRunner
 from rlinf.scheduler import Cluster, NodePlacementStrategy
-from rlinf.utils.placement import ModelParallelComponentPlacement, PlacementMode
+from rlinf.utils.placement import (
+    ModelParallelComponentPlacement,
+    PlacementMode,
+    TeacherComponentPlacement,
+)
 from rlinf.utils.utils import output_redirector
-from rlinf.workers.actor.ma_fsdp_actor_worker import MAFSDPActor
-from rlinf.workers.actor.ma_megatron_actor_worker import MAMegatronActor
+from rlinf.workers.actor import get_ma_actor_worker
 from rlinf.workers.agent.tool_worker import ToolWorkerInfo
 from rlinf.workers.inference.utils import get_inference_backend_worker
 from rlinf.workers.rollout.utils import get_rollout_backend_worker
+from rlinf.workers.teacher.runtime import launch_teacher_workers
 
 """Script to start Search-R1 training"""
 mp.set_start_method("spawn", force=True)
-
-
-def get_ma_actor_worker(cfg):
-    """Select the multi-agent actor worker based on training backend."""
-    if cfg.actor.training_backend == "fsdp":
-        return MAFSDPActor
-    if cfg.actor.training_backend == "megatron":
-        return MAMegatronActor
-    raise ValueError(
-        f"Unsupported training backend for Search-R1 actor: {cfg.actor.training_backend}"
-    )
 
 
 @hydra.main(version_base="1.1")
@@ -120,8 +114,15 @@ def main(cfg) -> None:
         ): ToolWorkerInfo(tool_names=["search"], has_session=False),
     }
 
+    teacher_runtime = None
+    if build_distillation_plan(cfg).enabled:
+        teacher_placement = TeacherComponentPlacement(cfg, cluster)
+        teacher_placement.validate_disjoint(component_placement)
+        teacher_runtime = launch_teacher_workers(cfg, cluster, teacher_placement)
+
     runner = AgentRunner(
         cfg=cfg,
+        teacher_runtime=teacher_runtime,
         placement=component_placement,
         train_dataset=train_ds,
         val_dataset=val_ds,
@@ -133,8 +134,13 @@ def main(cfg) -> None:
         tool_workers=tool_workers,
     )
 
-    runner.init_workers()
-    runner.run()
+    try:
+        runner.init_workers()
+        runner.run()
+    finally:
+        if teacher_runtime is not None:
+            runner.close_teacher_clients()
+            teacher_runtime.close()
 
 
 if __name__ == "__main__":

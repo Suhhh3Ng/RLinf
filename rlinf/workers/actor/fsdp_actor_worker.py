@@ -22,6 +22,15 @@ from torch.distributed.tensor import DTensor
 from torch.multiprocessing.reductions import reduce_tensor
 
 import rlinf.algorithms  # noqa: F401
+from rlinf.algorithms.distillation.config import (
+    DistillationLossConfig,
+    build_distillation_plan,
+)
+from rlinf.algorithms.distillation.losses import (
+    DistillationReductionContext,
+    combine_distillation_and_task_loss,
+    compute_distillation_loss,
+)
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.algorithms.utils import (
     apply_importance_sampling_correction,
@@ -70,6 +79,7 @@ from rlinf.utils.utils import (
     masked_mean,
     retrieve_model_state_dict_in_cpu,
 )
+from rlinf.workers.actor.distillation import fsdp_distillation_forward
 from rlinf.workers.rollout.utils import (
     RankMapper,
     instance_ids_to_entry_process_ranks,
@@ -117,6 +127,12 @@ class FSDPActor(FSDPModelManager, Worker):
         super().__init__(cfg_fsdp, self._world_size, self._rank)
 
         self.cfg = cfg
+        self.distillation_plan = build_distillation_plan(cfg)
+        self.distillation_loss_config = (
+            DistillationLossConfig(**cfg.distillation.get("distillation_loss", {}))
+            if self.distillation_plan.enabled
+            else None
+        )
 
         self.response_len = (
             cfg.actor.model.encoder_seq_length - cfg.data.max_prompt_length
@@ -449,7 +465,12 @@ class FSDPActor(FSDPModelManager, Worker):
         )
 
     def forward_batch(
-        self, m_batch: dict[str, torch.Tensor], calculate_entropy: bool = False
+        self,
+        m_batch: dict[str, torch.Tensor],
+        calculate_entropy: bool = False,
+        *,
+        distillation: bool = False,
+        select_ids: bool = False,
     ) -> torch.Tensor:
         input_ids = m_batch["input_ids"]
         attention_mask = m_batch["attention_mask"]
@@ -493,6 +514,31 @@ class FSDPActor(FSDPModelManager, Worker):
 
         logits.div_(self.cfg.algorithm.sampling_params.temperature)
 
+        if distillation:
+            packed = self.enable_dynamic_batch_size or self.variable_seq_lengths
+            if packed:
+                starts, ends = idx_starts, idx_ends
+            else:
+                lengths = m_batch["attention_mask"].sum(-1).tolist()
+                starts = (
+                    [0] * len(lengths)
+                    if False
+                    else (
+                        self.cfg.data.max_prompt_length - m_batch["prompt_lengths"]
+                    ).tolist()
+                )
+                ends = [int(a) + int(n) for a, n in zip(starts, lengths)]
+            return fsdp_distillation_forward(
+                self,
+                logits,
+                m_batch,
+                packed=packed,
+                starts=starts,
+                ends=ends,
+                response_only=True,
+                select_ids=select_ids,
+            )
+
         if self.enable_dynamic_batch_size or self.variable_seq_lengths:
             logprobs = unpack_fsdp_logprobs(
                 logits,
@@ -521,6 +567,125 @@ class FSDPActor(FSDPModelManager, Worker):
             return logprobs, entropy
 
         return logprobs
+
+    def configure_teacher(self, endpoints, student_policy_version="0"):
+        """Keep serializable endpoints for the update-preparation phase."""
+        from rlinf.workers.teacher.backend import tokenizer_fingerprint
+
+        if (
+            tokenizer_fingerprint(self.tokenizer)
+            != endpoints[0].model_info.tokenizer_fingerprint
+        ):
+            raise ValueError("Actor and Teacher tokenizer mappings must match")
+        self._teacher_endpoints = endpoints
+        self._student_policy_version = student_policy_version
+
+    def prepare_distillation_targets(self, batch):
+        """Freeze this round's Student support before the first optimizer update."""
+        if not self.distillation_plan.need_student_topk_selection:
+            return batch
+        import asyncio
+        from dataclasses import replace
+
+        from rlinf.data.schema.distillation import teacher_targets_to_batch
+        from rlinf.workers.teacher.client import TeacherClient
+
+        requests = batch.pop("teacher_requests")
+        if any(
+            request.student_policy_version != self._student_policy_version
+            for request in requests
+        ):
+            raise ValueError(
+                "Student top-k requests must match the current rollout weight version"
+            )
+        self._load_weight_and_optimizer()
+        was_training = self.model.training
+        self.model.eval()
+        count = torch.tensor(len(requests), device=Worker.torch_device_type)
+        torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.MAX)
+        scored_requests = []
+        try:
+            with torch.no_grad():
+                for index in range(int(count.item())):
+                    row = min(index, len(requests) - 1)
+                    if row < 0:
+                        raise ValueError(
+                            "Student selection requires at least one sequence per rank"
+                        )
+                    microbatch = {
+                        key: value[row : row + 1].to(Worker.torch_device_type)
+                        if isinstance(value, torch.Tensor)
+                        else value[row : row + 1]
+                        for key, value in batch.items()
+                    }
+                    selected = self.forward_batch(
+                        microbatch, distillation=True, select_ids=True
+                    ).cpu()[0]
+                    if index >= len(requests):
+                        continue
+                    request = requests[index]
+                    prompt = int(batch["prompt_lengths"][index])
+                    response = int(batch["response_lengths"][index])
+                    dynamic = bool(getattr(self, "is_dynamic_rollout_batch", False))
+                    raw_ids = (
+                        selected[: prompt + response]
+                        if dynamic
+                        else torch.cat(
+                            (
+                                torch.zeros(
+                                    (prompt, selected.shape[-1]), dtype=torch.long
+                                ),
+                                selected[:response],
+                            )
+                        )
+                    )
+                    scored_requests.append(
+                        replace(
+                            request,
+                            selected_token_ids=tuple(
+                                tuple(row) for row in raw_ids.tolist()
+                            ),
+                        )
+                    )
+        finally:
+            self.model.train(was_training)
+
+        async def score_all():
+            client = TeacherClient(self._teacher_endpoints)
+            try:
+                return await asyncio.gather(
+                    *(client.score(request) for request in scored_requests)
+                )
+            finally:
+                await client.close()
+
+        targets, scoring_error = None, None
+        try:
+            targets = asyncio.run(score_all())
+        except Exception as error:
+            scoring_error = f"{type(error).__name__}: {error}"
+        errors = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(errors, scoring_error)
+        failed = [error for error in errors if error is not None]
+        if failed:
+            raise RuntimeError(
+                f"Teacher preparation failed before the update: {failed[0]}"
+            )
+        dynamic = bool(getattr(self, "is_dynamic_rollout_batch", False))
+        batch.update(
+            teacher_targets_to_batch(
+                targets,
+                batch["prompt_lengths"].tolist(),
+                batch["response_lengths"].tolist(),
+                batch["input_ids"].shape[1] if dynamic else self.response_len,
+                response_only=not dynamic,
+            )
+        )
+        return batch
+
+    def forward_training_batch(self, batch, plan=None):
+        """Return differentiable distillation outputs from a single model forward."""
+        return self.forward_batch(batch, distillation=True)
 
     def inference_step(
         self,
@@ -684,61 +849,126 @@ class FSDPActor(FSDPModelManager, Worker):
         )
         for k, v in m_batch.items():
             m_batch[k] = (
-                v.to(Worker.torch_device_type) if isinstance(v, torch.Tensor) else v
+                v.to(Worker.torch_device_type)
+                if isinstance(v, torch.Tensor) and k != "teacher_logprobs"
+                else v
             )
 
         # batch for forward
-        logprobs, entropy = self.forward_batch(m_batch, True)
-
-        # batch for backward
-        # Prefer recomputed_logprobs (from actor inference), fallback to rollout_logprobs
-        old_logprobs = m_batch.get("recomputed_logprobs")
-        if old_logprobs is None:
-            old_logprobs = m_batch["rollout_logprobs"]
-        advantages = m_batch["advantages"]
-        ref_logprobs = None
-        if "ref_logprobs" in m_batch:
-            ref_logprobs = m_batch["ref_logprobs"]
+        distillation_forward = None
+        if self.distillation_plan.enabled:
+            distillation_forward = self.forward_training_batch(m_batch)
+            logprobs, entropy = (
+                distillation_forward.logprobs,
+                distillation_forward.entropy,
+            )
+        else:
+            logprobs, entropy = self.forward_batch(m_batch, True)
 
         loss_mask = self.get_response_loss_mask(m_batch)
+        ref_logprobs = m_batch.get("ref_logprobs")
+        loss = None
+        mbs_metrics_data = {}
+        if (
+            not self.distillation_plan.enabled
+            or self.distillation_plan.need_task_advantages
+        ):
+            # batch for backward
+            # Prefer recomputed_logprobs (from actor inference), fallback to rollout_logprobs
+            old_logprobs = m_batch.get("recomputed_logprobs")
+            if old_logprobs is None:
+                old_logprobs = m_batch["rollout_logprobs"]
+            advantages = m_batch["advantages"]
+            ref_logprobs = None
+            if "ref_logprobs" in m_batch:
+                ref_logprobs = m_batch["ref_logprobs"]
 
-        clip_ratio = self.cfg.algorithm.ratio_clip_eps
-        clip_ratio_low = self.cfg.algorithm.get("clip_ratio_low", None)
-        clip_ratio_high = self.cfg.algorithm.get("clip_ratio_high", None)
-        clip_ratio_low = clip_ratio_low if clip_ratio_low is not None else clip_ratio
-        clip_ratio_high = clip_ratio_high if clip_ratio_high is not None else clip_ratio
-        clip_ratio_c = self.cfg.algorithm.get("clip_ratio_c", 3.0)
+            loss_mask = self.get_response_loss_mask(m_batch)
 
-        if self.cfg.algorithm.get("importance_sampling_fix", False):
-            if (
-                "rollout_logprobs" not in m_batch
-                or "recomputed_logprobs" not in m_batch
-            ):
-                raise ValueError(
-                    "importance_sampling_fix requires both rollout_logprobs and recomputed_logprobs"
+            clip_ratio = self.cfg.algorithm.ratio_clip_eps
+            clip_ratio_low = self.cfg.algorithm.get("clip_ratio_low", None)
+            clip_ratio_high = self.cfg.algorithm.get("clip_ratio_high", None)
+            clip_ratio_low = (
+                clip_ratio_low if clip_ratio_low is not None else clip_ratio
+            )
+            clip_ratio_high = (
+                clip_ratio_high if clip_ratio_high is not None else clip_ratio
+            )
+            clip_ratio_c = self.cfg.algorithm.get("clip_ratio_c", 3.0)
+
+            if self.cfg.algorithm.get("importance_sampling_fix", False):
+                if (
+                    "rollout_logprobs" not in m_batch
+                    or "recomputed_logprobs" not in m_batch
+                ):
+                    raise ValueError(
+                        "importance_sampling_fix requires both rollout_logprobs and recomputed_logprobs"
+                    )
+                advantages, _, _ = apply_importance_sampling_correction(
+                    advantages,
+                    m_batch["recomputed_logprobs"],
+                    m_batch["rollout_logprobs"],
+                    self.cfg.algorithm.importance_sampling_clip,
                 )
-            advantages, _, _ = apply_importance_sampling_correction(
-                advantages,
-                m_batch["recomputed_logprobs"],
-                m_batch["rollout_logprobs"],
-                self.cfg.algorithm.importance_sampling_clip,
+
+            loss, mbs_metrics_data = policy_loss(
+                task_type=self.task_type,
+                loss_type=self.cfg.algorithm.loss_type,
+                loss_agg_func=self.loss_agg_func,
+                logprobs=logprobs,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+                clip_ratio_c=clip_ratio_c,
+                clip_ratio_low=clip_ratio_low,
+                clip_ratio_high=clip_ratio_high,
+                loss_mask=loss_mask,
+                clip_log_ratio_min=self.cfg.algorithm.get("clip_log_ratio_min", None),
+                clip_log_ratio_max=self.cfg.algorithm.get("clip_log_ratio_max", None),
+                fast_path_zero_loss_mask=True,
             )
 
-        loss, mbs_metrics_data = policy_loss(
-            task_type=self.task_type,
-            loss_type=self.cfg.algorithm.loss_type,
-            loss_agg_func=self.loss_agg_func,
-            logprobs=logprobs,
-            old_logprobs=old_logprobs,
-            advantages=advantages,
-            clip_ratio_c=clip_ratio_c,
-            clip_ratio_low=clip_ratio_low,
-            clip_ratio_high=clip_ratio_high,
-            loss_mask=loss_mask,
-            clip_log_ratio_min=self.cfg.algorithm.get("clip_log_ratio_min", None),
-            clip_log_ratio_max=self.cfg.algorithm.get("clip_log_ratio_max", None),
-            fast_path_zero_loss_mask=True,
-        )
+        if self.distillation_plan.enabled:
+            aligned_batch = dict(m_batch)
+            if self.distillation_plan.use_policy_gradient and self.cfg.algorithm.get(
+                "importance_sampling_fix", False
+            ):
+                old = m_batch["recomputed_logprobs"]
+                weights, _, _ = apply_importance_sampling_correction(
+                    torch.ones_like(old),
+                    old,
+                    m_batch["rollout_logprobs"],
+                    self.cfg.algorithm.importance_sampling_clip,
+                )
+                aligned_batch["rollout_is_weights"] = weights
+
+            aligned_batch["response_mask"] = loss_mask
+            aligned_batch["teacher_valid_mask"] = m_batch["teacher_valid_mask"].to(
+                loss_mask.device
+            )
+            # Sampled targets are small; full targets were consumed in token chunks.
+            if self.distillation_plan.target_format == "sampled":
+                aligned_batch["teacher_logprobs"] = m_batch["teacher_logprobs"].to(
+                    loss_mask.device
+                )
+            distill_loss, distill_metrics = compute_distillation_loss(
+                distillation_forward,
+                aligned_batch,
+                plan=self.distillation_plan,
+                config=self.distillation_loss_config,
+                reduction=DistillationReductionContext(
+                    self._distillation_denominator,
+                    mode=self.cfg.algorithm.loss_agg_func,
+                    dp_size=self._world_size,
+                    gradient_divisor=self.gradient_accumulation,
+                ),
+            )
+            loss = combine_distillation_and_task_loss(
+                loss,
+                distill_loss,
+                use_task_rewards=self.distillation_plan.need_task_rewards,
+                coefficient=self.distillation_loss_config.distillation_loss_coef,
+            )
+            mbs_metrics_data.update(distill_metrics)
 
         entropy_loss = torch.tensor(0.0, device=Worker.torch_platform.current_device())
         if self.calculate_entropy:
@@ -773,6 +1003,23 @@ class FSDPActor(FSDPModelManager, Worker):
     def training_step(
         self, batch: dict[str, torch.Tensor] | BatchResizingIterator
     ) -> tuple[dict[str, torch.Tensor], float, list[float]]:
+        if self.distillation_plan.enabled:
+            if not isinstance(batch, dict):
+                raise ValueError(
+                    "Synchronous distillation requires a complete update batch"
+                )
+            mask = (
+                self.get_response_loss_mask(batch).cpu()
+                & batch["teacher_valid_mask"].cpu()
+            )
+            count = (
+                mask.sum()
+                if self.cfg.algorithm.loss_agg_func == "token-mean"
+                else mask.any(-1).sum()
+            )
+            count = count.to(Worker.torch_device_type, dtype=torch.float64)
+            torch.distributed.all_reduce(count)
+            self._distillation_denominator = count.item()
         if isinstance(batch, dict):
             global_batch_size = batch["input_ids"].shape[0]
             assert global_batch_size % self.micro_batch_size == 0, (
@@ -901,7 +1148,7 @@ class FSDPActor(FSDPModelManager, Worker):
             "do_offload argument of run_inference/run_training is not supported in FSDP for now"
         )
 
-        if self.is_pipeline:
+        if self.is_pipeline and not self.distillation_plan.enabled:
             return self.run_training_pipeline(input_channel)
 
         batches = []
@@ -914,10 +1161,14 @@ class FSDPActor(FSDPModelManager, Worker):
             f"Expected {self.total_batch_size_per_dp} sequences from channel, but got {recv_batch_size}"
         )
         global_batch = RolloutResult.merge_batches(batches)
+        if self.distillation_plan.enabled:
+            global_batch = self.prepare_distillation_targets(global_batch)
 
-        assert (
-            "recomputed_logprobs" in global_batch or "rollout_logprobs" in global_batch
-        )
+        if self.distillation_plan.need_old_logprobs:
+            assert (
+                "recomputed_logprobs" in global_batch
+                or "rollout_logprobs" in global_batch
+            )
 
         # Compute advantages and returns
         global_batch = self.compute_advantages_and_returns(global_batch)
@@ -925,7 +1176,10 @@ class FSDPActor(FSDPModelManager, Worker):
         if self.enable_dp_load_balance:
             global_batch = self._dp_load_balance(global_batch)
 
-        if self.cfg.algorithm.normalize_advantages:
+        if (
+            self.distillation_plan.need_task_advantages
+            and self.cfg.algorithm.normalize_advantages
+        ):
             mask = global_batch["response_mask"][:, -self.response_len :]
             global_batch["advantages"] = masked_normalization(
                 global_batch["advantages"], mask
@@ -973,6 +1227,12 @@ class FSDPActor(FSDPModelManager, Worker):
         Args:
             batch (Dict[str, torch.Tensor]): The rollout batch.
         """
+        if (
+            self.distillation_plan.enabled
+            and not self.distillation_plan.need_task_advantages
+        ):
+            return batch
+
         with self.worker_timer():
             if batch.get("advantages", None) is None:
                 mask = batch["response_mask"][:, -self.response_len :]

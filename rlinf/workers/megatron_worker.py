@@ -27,6 +27,11 @@ from megatron.training.training import unwrap_model
 from omegaconf import DictConfig
 
 import rlinf.algorithms  # noqa: F401
+from rlinf.algorithms.distillation.config import (
+    DistillationLossConfig,
+    DistillationPlan,
+    build_distillation_plan,
+)
 from rlinf.algorithms.registry import (
     calculate_adv_and_returns,
 )
@@ -107,6 +112,14 @@ class MegatronWorker(MegatronModelManager, Worker):
             raise ValueError(f"Role {role} is not defined in the configuration.")
         super().__init__(role_cfg)
         self.cfg = cfg
+        self.distillation_plan = (
+            build_distillation_plan(cfg) if role == "actor" else DistillationPlan()
+        )
+        self.distillation_loss_config = (
+            DistillationLossConfig(**cfg.distillation.get("distillation_loss", {}))
+            if self.distillation_plan.enabled
+            else None
+        )
         self.inference_cfg = getattr(cfg, "_".join([role, "inference"]), None)
         if self.inference_cfg is None:
             # compatible with old code
@@ -605,6 +618,28 @@ class MegatronWorker(MegatronModelManager, Worker):
         Args:
             batch (Dict[str, torch.Tensor] | BatchResizingIterator): The input batch containing the data for the forward pass.
         """
+        if self.distillation_plan.enabled:
+            if not isinstance(batch, dict):
+                raise ValueError(
+                    "Distillation requires a complete synchronous update batch"
+                )
+            dynamic = bool(getattr(self, "is_dynamic_rollout_batch", False))
+            mask = (
+                batch["response_mask"]
+                if dynamic
+                else batch["response_mask"][:, -self.response_len :]
+            )
+            mask = mask.cpu() & batch["teacher_valid_mask"].cpu()
+            count = (
+                mask.sum()
+                if self.cfg.algorithm.loss_agg_func == "token-mean"
+                else mask.any(-1).sum()
+            )
+            count = count.to(self.torch_device_type, dtype=torch.float64)
+            torch.distributed.all_reduce(
+                count, group=parallel_state.get_data_parallel_group()
+            )
+            self._distillation_denominator = count.item()
         set_sync_funcs(self, forward_only=False)
         for model_chunk in self.model:
             model_chunk.zero_grad_buffer()
@@ -692,7 +727,7 @@ class MegatronWorker(MegatronModelManager, Worker):
         compute_rollout_metrics: bool = True,
     ):
         """Run the training loop."""
-        if self.is_pipeline:
+        if self.is_pipeline and not self.distillation_plan.enabled:
             with self.worker_timer():
                 return self.run_training_pipeline(input_channel)
 
@@ -711,11 +746,17 @@ class MegatronWorker(MegatronModelManager, Worker):
         batch = RolloutResult.merge_batches(batches)
         rollout_result = RolloutResult.merge_result_list(rollout_results)
 
-        assert "recomputed_logprobs" in batch or "rollout_logprobs" in batch
+        if self.distillation_plan.enabled:
+            batch = self.prepare_distillation_targets(batch)
+        if self.distillation_plan.need_old_logprobs:
+            assert "recomputed_logprobs" in batch or "rollout_logprobs" in batch
         # Compute advantages and returns
-        if "advantages" not in batch:
+        if self.distillation_plan.need_task_advantages and "advantages" not in batch:
             batch = self.compute_advantages_and_returns(batch)
-            if self.cfg.algorithm.normalize_advantages:
+            if (
+                self.distillation_plan.need_task_advantages
+                and self.cfg.algorithm.normalize_advantages
+            ):
                 mask = batch["attention_mask"][:, -self.response_len :]
                 batch["advantages"] = masked_normalization(
                     batch["advantages"],
@@ -749,7 +790,10 @@ class MegatronWorker(MegatronModelManager, Worker):
             return None, None
 
         # Advantage normalization
-        if self.cfg.algorithm.normalize_advantages:
+        if (
+            self.distillation_plan.need_task_advantages
+            and self.cfg.algorithm.normalize_advantages
+        ):
             mask = batch["response_mask"][:, -self.response_len :]
             batch["advantages"] = masked_normalization(
                 batch["advantages"],
@@ -758,7 +802,10 @@ class MegatronWorker(MegatronModelManager, Worker):
             )
 
         # Valid token scale
-        if self.cfg.algorithm.use_valid_token_scale:
+        if (
+            not self.distillation_plan.enabled
+            and self.cfg.algorithm.use_valid_token_scale
+        ):
             self._setup_valid_token_scale(batch)
 
         if self.use_profiler:
@@ -1297,6 +1344,12 @@ class MegatronWorker(MegatronModelManager, Worker):
         Args:
             batch (Dict[str, torch.Tensor]): The rollout batch.
         """
+        if (
+            self.distillation_plan.enabled
+            and not self.distillation_plan.need_task_advantages
+        ):
+            return batch
+
         with self.worker_timer():
             if batch["rewards"].numel() == 0:
                 batch["advantages"] = torch.zeros(

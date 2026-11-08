@@ -176,6 +176,53 @@ def compute_decoupled_ppo_actor_loss(
     return pg_loss, metrics_data
 
 
+def compute_ppo_actor_loss_tokens(
+    logprobs: torch.Tensor,
+    old_logprobs: torch.Tensor,
+    advantages: torch.Tensor,
+    loss_mask: torch.Tensor,
+    *,
+    clip_ratio_low: float,
+    clip_ratio_high: float,
+    clip_ratio_c: float | None = None,
+    clip_log_ratio_min: float | None = None,
+    clip_log_ratio_max: float | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Return clipped token losses and diagnostics without reduction or reweighting."""
+    # For numerical stability.
+    raw_log_ratio = logprobs - old_logprobs
+    log_ratio = torch.where(loss_mask, raw_log_ratio, 0.0)
+    if clip_log_ratio_min is not None:
+        log_ratio = torch.clamp(log_ratio, min=clip_log_ratio_min)
+    if clip_log_ratio_max is not None:
+        log_ratio = torch.clamp(log_ratio, max=clip_log_ratio_max)
+    ratio = torch.where(loss_mask, torch.exp(log_ratio), 0)
+
+    clipped_ratio = torch.clamp(ratio, 1.0 - clip_ratio_low, 1.0 + clip_ratio_high)
+    policy_loss1 = -advantages * ratio
+    policy_loss2 = -advantages * clipped_ratio
+
+    clip_mask = policy_loss1.detach() < policy_loss2.detach()
+
+    policy_loss = torch.max(policy_loss1, policy_loss2)
+    if clip_ratio_c is not None:
+        assert clip_ratio_c > 1.0, "clip_ratio_c must be greater than 1.0"
+        policy_loss3 = torch.sign(advantages) * clip_ratio_c * advantages
+        dual_clip_mask = policy_loss3.detach() < policy_loss.detach()
+        policy_loss = torch.min(policy_loss, policy_loss3)
+    else:
+        dual_clip_mask = torch.zeros_like(clip_mask)
+
+    return policy_loss, {
+        "raw_log_ratio": raw_log_ratio,
+        "log_ratio": log_ratio,
+        "ratio": ratio,
+        "clipped_ratio": clipped_ratio,
+        "clip_mask": clip_mask,
+        "dual_clip_mask": dual_clip_mask,
+    }
+
+
 def compute_ppo_actor_loss(
     logprobs: torch.Tensor,
     old_logprobs: torch.Tensor,
@@ -298,29 +345,23 @@ def compute_ppo_actor_loss(
             ),
         }
 
-    # For numerical stability.
-    raw_log_ratio = logprobs - old_logprobs
-    log_ratio = torch.where(loss_mask, raw_log_ratio, 0.0)
-    if clip_log_ratio_min is not None:
-        log_ratio = torch.clamp(log_ratio, min=clip_log_ratio_min)
-    if clip_log_ratio_max is not None:
-        log_ratio = torch.clamp(log_ratio, max=clip_log_ratio_max)
-    ratio = torch.where(loss_mask, torch.exp(log_ratio), 0)
-
-    clipped_ratio = torch.clamp(ratio, 1.0 - clip_ratio_low, 1.0 + clip_ratio_high)
-    policy_loss1 = -advantages * ratio
-    policy_loss2 = -advantages * clipped_ratio
-
-    clip_mask = policy_loss1.detach() < policy_loss2.detach()
-
-    policy_loss = torch.max(policy_loss1, policy_loss2)
-    if clip_ratio_c is not None:
-        assert clip_ratio_c > 1.0, "clip_ratio_c must be greater than 1.0"
-        policy_loss3 = torch.sign(advantages) * clip_ratio_c * advantages
-        dual_clip_mask = policy_loss3.detach() < policy_loss.detach()
-        policy_loss = torch.min(policy_loss, policy_loss3)
-    else:
-        dual_clip_mask = torch.zeros_like(clip_mask)
+    policy_loss, token_metrics = compute_ppo_actor_loss_tokens(
+        logprobs,
+        old_logprobs,
+        advantages,
+        loss_mask,
+        clip_ratio_low=clip_ratio_low,
+        clip_ratio_high=clip_ratio_high,
+        clip_ratio_c=clip_ratio_c,
+        clip_log_ratio_min=clip_log_ratio_min,
+        clip_log_ratio_max=clip_log_ratio_max,
+    )
+    raw_log_ratio = token_metrics["raw_log_ratio"]
+    log_ratio = token_metrics["log_ratio"]
+    ratio = token_metrics["ratio"]
+    clipped_ratio = token_metrics["clipped_ratio"]
+    clip_mask = token_metrics["clip_mask"]
+    dual_clip_mask = token_metrics["dual_clip_mask"]
 
     metric_policy_loss_abs = loss_agg_func(
         policy_loss.abs(), loss_mask, loss_mask_ratio
@@ -329,7 +370,6 @@ def compute_ppo_actor_loss(
         policy_loss, loss_mask, loss_mask_ratio
     )  # default max_episode_steps is None
 
-    clip_mask = policy_loss1.detach() < policy_loss2.detach()
     dual_clip_mask = (dual_clip_mask * loss_mask).bool()
 
     dual_cliped_ratio = torch.where(dual_clip_mask, ratio, 0)

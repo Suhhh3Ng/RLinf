@@ -394,6 +394,23 @@ class VLLMWorker(Worker):
         if self._use_auto_scheduler:
             asyncio.create_task(self._scheduler.main_loop())
 
+    async def close_teacher(self):
+        """Release this worker's Teacher connections without stopping the service."""
+        scorer = getattr(self, "_teacher_scorer", None)
+        self._teacher_scorer = None
+        if scorer is not None:
+            await scorer.close()
+
+    def configure_teacher(self, endpoints, student_policy_version="0"):
+        """Attach frozen Teacher endpoints after engine initialization."""
+        from rlinf.workers.teacher.scoring import RolloutTeacherScorer
+
+        if getattr(self, "_teacher_scorer", None) is None:
+            self._teacher_scorer = RolloutTeacherScorer(
+                self._cfg, endpoints, self._tokenizer
+            )
+        self._teacher_scorer.student_policy_version = student_policy_version
+
     async def _async_generate_group(self, seq_group_info: SeqGroupInfo) -> SeqGroupInfo:
         async def generate_with_idx(
             idx: int,
@@ -462,10 +479,36 @@ class VLLMWorker(Worker):
                 strict=True,
             )
         ]
+        teacher_tasks = []
+        scorer = getattr(self, "_teacher_scorer", None)
         for future in asyncio.as_completed(tasks):
             idx, request_output = await future
             seq_group_info.record_vllm_result(idx, request_output, self._logger)
+            response_ids = list(seq_group_info.results[idx].outputs[0].token_ids)
+            if scorer is not None and idx in seq_group_info.idx_completed:
 
+                async def score_one(index=idx, ids=list(response_ids)):
+                    return index, await scorer.score_sequence(
+                        list(seq_group_info.input_ids), ids, str(seq_group_info.id)
+                    )
+
+                teacher_tasks.append(asyncio.create_task(score_one()))
+
+        if scorer is not None:
+            if seq_group_info.idx_aborted:
+                for task in teacher_tasks:
+                    task.cancel()
+                await asyncio.gather(*teacher_tasks, return_exceptions=True)
+                raise RuntimeError(
+                    "Synchronous distillation cannot consume aborted partial sequences"
+                )
+            values = [None] * seq_group_info.group_size
+            for index, target in await asyncio.gather(*teacher_tasks):
+                values[index] = target
+            if scorer.plan.need_student_topk_selection:
+                seq_group_info.teacher_requests = values
+            else:
+                seq_group_info.teacher_targets = values
         return seq_group_info
 
     async def rollout(self, input_channel: Channel, output_channel: Channel) -> None:

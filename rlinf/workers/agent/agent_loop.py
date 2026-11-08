@@ -45,6 +45,9 @@ class AgentLoopOutput:
     prompt_ids: list[int]
     """Response token ids including LLM generated token, tool response token."""
     response_ids: list[int]
+    teacher_targets: object | None = None
+    teacher_request: object | None = None
+    student_policy_version: str | None = None
     """Prompt text decoded from prompt_ids"""
     prompt_text: str = ""
     """Response text decoded from response_ids"""
@@ -97,7 +100,12 @@ class AgentLoopWorker(Worker):
         if cfg.runner.task_type == "reasoning_eval":
             self.return_logprobs = False
         else:
-            self.return_logprobs = not cfg.algorithm.recompute_logprobs
+            from rlinf.algorithms.distillation.config import build_distillation_plan
+
+            self.return_logprobs = (
+                build_distillation_plan(cfg).need_old_logprobs
+                and not cfg.algorithm.recompute_logprobs
+            )
         self.is_dynamic_rollout_batch = cfg.agentloop.get(
             "is_dynamic_rollout_batch", False
         )
@@ -231,6 +239,30 @@ class AgentLoopWorker(Worker):
         )
         return wi_ids[len(wo_ids) :]
 
+    async def close_teacher(self):
+        """Release this worker's Teacher connections without stopping the service."""
+        scorer = getattr(self, "_teacher_scorer", None)
+        self._teacher_scorer = None
+        if scorer is not None:
+            await scorer.close()
+
+    def configure_teacher(self, endpoints, student_policy_version="0"):
+        """Attach Teacher scoring to training Agent outputs."""
+        from rlinf.workers.teacher.scoring import RolloutTeacherScorer
+
+        if getattr(self, "_teacher_scorer", None) is None:
+            self._teacher_scorer = RolloutTeacherScorer(
+                self.cfg, endpoints, self.tokenizer
+            )
+        self._teacher_scorer.student_policy_version = student_policy_version
+
+    async def _run_query_with_teacher(self, *args, **kwargs):
+        output = await self.run_one_query(*args, **kwargs)
+        scorer = getattr(self, "_teacher_scorer", None)
+        if scorer is not None:
+            output = await scorer.score_agent_output(output)
+        return output
+
     async def run_agentloop_rollout_group(
         self,
         input_ids: list[int],
@@ -244,7 +276,9 @@ class AgentLoopWorker(Worker):
         rollout_tasks = []
         # grpo group_size
         for _ in range(group_size):
-            task = asyncio.create_task(self.run_one_query(copy.deepcopy(input_ids)))
+            task = asyncio.create_task(
+                self._run_query_with_teacher(copy.deepcopy(input_ids))
+            )
             rollout_tasks.append(task)
 
         task_results = await asyncio.gather(*rollout_tasks)
@@ -317,6 +351,12 @@ class AgentLoopWorker(Worker):
         is_end = [True for _ in task_results]
         answers = [answer] * len(task_results)
         return RolloutResult(
+            teacher_targets=[r.teacher_targets for r in task_results]
+            if task_results and task_results[0].teacher_targets is not None
+            else None,
+            teacher_requests=[r.teacher_request for r in task_results]
+            if task_results and task_results[0].teacher_request is not None
+            else None,
             num_sequence=len(task_results),
             group_size=len(task_results),
             prompt_lengths=prompt_lengths,
@@ -469,7 +509,7 @@ class MultiAgentLoopWorker(AgentLoopWorker):
         # grpo group_size
         for _ in range(group_size):
             task = asyncio.create_task(
-                self.run_one_query(copy.deepcopy(input_dict), answer=answer)
+                self._run_query_with_teacher(copy.deepcopy(input_dict), answer=answer)
             )
             rollout_tasks.append(task)
 
@@ -656,7 +696,21 @@ class MultiAgentLoopWorker(AgentLoopWorker):
                 is_end.append(single_turn_output.is_end)
                 rewards.append(single_turn_output.reward_score)
 
+        retained_turns = [
+            turn
+            for output in task_results
+            for turn in output.single_turn_outputs
+            if not turn.extra_fields.get("not_training", False)
+        ]
+        if rewards and all(reward is None for reward in rewards):
+            rewards = None
+        elif rewards and any(reward is None for reward in rewards):
+            raise ValueError("Expected either all turn rewards or no turn rewards")
+        targets = [turn.teacher_targets for turn in retained_turns]
+        requests = [turn.teacher_request for turn in retained_turns]
         return DynamicRolloutResult(
+            teacher_targets=targets if targets and targets[0] is not None else None,
+            teacher_requests=requests if requests and requests[0] is not None else None,
             num_sequence=len(idx_to_traj),
             group_size=len(task_results),
             idx_to_traj=idx_to_traj,

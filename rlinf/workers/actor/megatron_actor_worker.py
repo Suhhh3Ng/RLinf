@@ -37,6 +37,12 @@ from rlinf.utils.placement import (
 from rlinf.utils.resharding.mcore_weight_reshard import MegatronCoreWeightReshard
 from rlinf.utils.resharding.reshard_config import ReshardConfig
 from rlinf.utils.utils import retrieve_model_state_dict_in_cpu
+from rlinf.workers.actor.megatron_distillation import (
+    combine_actor_distillation,
+    distribution_processor,
+    select_student_ids,
+    teacher_processor_args,
+)
 from rlinf.workers.megatron_worker import MegatronWorker
 from rlinf.workers.rollout.utils import (
     RankMapper,
@@ -61,6 +67,18 @@ class MegatronActor(MegatronWorker):
             cfg (DictConfig): The configuration for the actor.
         """
         super().__init__(cfg, placement, role)
+        from rlinf.algorithms.distillation.config import (
+            DistillationLossConfig,
+            build_distillation_plan,
+        )
+
+        self.distillation_plan = build_distillation_plan(cfg)
+        self.distillation_loss_config = (
+            DistillationLossConfig(**cfg.distillation.get("distillation_loss", {}))
+            if self.distillation_plan.enabled
+            else None
+        )
+        self._select_distillation_ids = False
 
         # The sharding coordinates dst_tp_rank / dst_ep_rank are derived in
         # _setup_rollout_weight_dst_ranks, not here: they follow the target
@@ -132,13 +150,110 @@ class MegatronActor(MegatronWorker):
     def process_inference_output(self, rollout_result, infer_out):
         rollout_result.recomputed_logprobs = infer_out
 
+    def configure_teacher(self, endpoints, student_policy_version="0"):
+        """Store immutable scoring endpoints for the synchronous update."""
+        from rlinf.workers.teacher.backend import tokenizer_fingerprint
+
+        if (
+            tokenizer_fingerprint(self.tokenizer)
+            != endpoints[0].model_info.tokenizer_fingerprint
+        ):
+            raise ValueError("Actor and Teacher tokenizer mappings must match")
+        self._teacher_endpoints = endpoints
+        self._student_policy_version = student_policy_version
+
+    def prepare_distillation_targets(self, batch):
+        """Select support with rollout weights before any optimizer step."""
+        if not self.distillation_plan.need_student_topk_selection:
+            return batch
+        import asyncio
+        from dataclasses import replace
+        from uuid import uuid4
+
+        from rlinf.data.schema.distillation import teacher_targets_to_batch
+        from rlinf.workers.teacher.client import TeacherClient
+
+        requests = batch.pop("teacher_requests")
+        if any(
+            request.student_policy_version != self._student_policy_version
+            for request in requests
+        ):
+            raise ValueError(
+                "Student top-k request version differs from the Actor rollout version"
+            )
+        self._load_weight_and_optimizer()
+        self._select_distillation_ids = True
+        try:
+            selected = self.inference_step(batch).cpu()
+        finally:
+            self._select_distillation_ids = False
+        dynamic = bool(getattr(self, "is_dynamic_rollout_batch", False))
+        prepared = []
+        for index, request in enumerate(requests):
+            prompt = int(batch["prompt_lengths"][index])
+            response = int(batch["response_lengths"][index])
+            ids = (
+                selected[index, : prompt + response]
+                if dynamic
+                else torch.cat(
+                    (
+                        torch.zeros((prompt, selected.shape[-1]), dtype=torch.long),
+                        selected[index, :response],
+                    )
+                )
+            )
+            prepared.append(
+                replace(
+                    request,
+                    request_id=uuid4().hex,
+                    selected_token_ids=tuple(tuple(row) for row in ids.tolist()),
+                )
+            )
+
+        async def score_all():
+            client = TeacherClient(self._teacher_endpoints)
+            try:
+                return await asyncio.gather(
+                    *(client.score(request) for request in prepared)
+                )
+            finally:
+                await client.close()
+
+        targets, scoring_error = None, None
+        try:
+            targets = asyncio.run(score_all())
+        except Exception as error:
+            scoring_error = f"{type(error).__name__}: {error}"
+        errors = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(errors, scoring_error)
+        failed = [error for error in errors if error is not None]
+        if failed:
+            raise RuntimeError(
+                f"Teacher preparation failed before the update: {failed[0]}"
+            )
+        batch.update(
+            teacher_targets_to_batch(
+                targets,
+                batch["prompt_lengths"].tolist(),
+                batch["response_lengths"].tolist(),
+                batch["input_ids"].shape[1] if dynamic else self.response_len,
+                response_only=not dynamic,
+            )
+        )
+        return batch
+
     def get_forward_step_func(self):
         """Acquire the forward step function for the model."""
 
         def forward_output_and_loss_func(dataloader_iter, model):
             batch = next(dataloader_iter)
 
-            batch = {key: val.cuda() for key, val in batch.items()}
+            batch = {
+                key: val.to(self.torch_device_type)
+                if isinstance(val, torch.Tensor) and key != "teacher_logprobs"
+                else val
+                for key, val in batch.items()
+            }
 
             input_ids = batch["input_ids"]
             attention_mask = batch["attention_mask"]
@@ -158,10 +273,24 @@ class MegatronActor(MegatronWorker):
             label_mask[:, : -response_len - 1] = False
             label_mask[:, -1] = False
 
-            def logits_processor(logits, label, label_mask):
+            def logits_processor(logits, label, label_mask, **teacher_args):
                 assert logits.shape[:2] == label.shape[:2]
                 assert label.shape == label_mask.shape
 
+                if self._select_distillation_ids:
+                    return {"student_topk_ids": select_student_ids(self, logits)}
+                distribution = {}
+                if (
+                    self.distillation_plan.enabled
+                    and self.return_loss
+                    and self.distillation_plan.target_format != "sampled"
+                ):
+                    distribution = distribution_processor(self, logits, **teacher_args)
+                    if (
+                        not self.distillation_plan.need_current_logprobs
+                        and not self.calculate_entropy
+                    ):
+                        return distribution
                 if self.calculate_entropy:
                     entropy, log_probs = vocab_parallel_entropy_and_log_probs(
                         logits,
@@ -175,9 +304,13 @@ class MegatronActor(MegatronWorker):
                     log_probs = log_probs.masked_fill(~label_mask, 0.0)
                     ret = {"log_probs": log_probs}
 
+                ret.update(distribution)
                 return ret
 
             logits_processor_args = {"label": label, "label_mask": label_mask}
+            logits_processor_args.update(
+                teacher_processor_args(self, batch, dynamic=False)
+            )
 
             output = self.custom_forward(
                 model,
@@ -198,6 +331,10 @@ class MegatronActor(MegatronWorker):
 
                 # in last stage need to get the log_probs from the output
                 if unwrap_model(model).post_process:
+                    if self._select_distillation_ids:
+                        ids = output["student_topk_ids"]
+                        ids = ids[:, -response_len - 1 : -1]
+                        return ids, id_func
                     mask = batch["response_mask"][:, -response_len:]
                     output = output["log_probs"][:, -response_len - 1 : -1].contiguous()
                     output = output * mask
@@ -205,55 +342,69 @@ class MegatronActor(MegatronWorker):
                 return output, id_func
 
             def loss_func(output):
-                curr_logprobs = output["log_probs"][
-                    :, -response_len - 1 : -1
-                ].contiguous()
-
-                advantages = batch["advantages"]
-                # Prefer recomputed_logprobs (from actor inference), fallback to rollout_logprobs
-                old_logprobs = batch.get("recomputed_logprobs")
-                if old_logprobs is None:
-                    old_logprobs = batch["rollout_logprobs"]
-                ref_logprobs = None
-                if "ref_logprobs" in batch:
-                    ref_logprobs = batch["ref_logprobs"]
-
-                if self.cfg.algorithm.get("importance_sampling_fix", False):
-                    if (
-                        "rollout_logprobs" not in batch
-                        or "recomputed_logprobs" not in batch
-                    ):
-                        raise ValueError(
-                            "importance_sampling_fix requires both rollout_logprobs and recomputed_logprobs"
-                        )
-                    advantages, _, _ = apply_importance_sampling_correction(
-                        advantages,
-                        batch["recomputed_logprobs"],
-                        batch["rollout_logprobs"],
-                        self.cfg.algorithm.importance_sampling_clip,
-                    )
+                curr_logprobs = output.get(
+                    "log_probs",
+                    torch.zeros_like(batch["response_mask"], dtype=torch.float32),
+                )[:, -response_len - 1 : -1].contiguous()
 
                 mask = batch["response_mask"][:, -response_len:]
+                ref_logprobs = batch.get("ref_logprobs")
+                loss, metrics_data = None, {}
+                if (
+                    not self.distillation_plan.enabled
+                    or self.distillation_plan.need_task_advantages
+                ):
+                    advantages = batch["advantages"]
+                    # Prefer recomputed_logprobs (from actor inference), fallback to rollout_logprobs
+                    old_logprobs = batch.get("recomputed_logprobs")
+                    if old_logprobs is None:
+                        old_logprobs = batch["rollout_logprobs"]
+                    ref_logprobs = None
+                    if "ref_logprobs" in batch:
+                        ref_logprobs = batch["ref_logprobs"]
 
-                loss, metrics_data = policy_loss(
-                    task_type=self.cfg.runner.task_type,
-                    loss_type=self.cfg.algorithm.loss_type,
-                    loss_agg_func=self.loss_agg_func,
-                    logprobs=curr_logprobs,
-                    old_logprobs=old_logprobs,
-                    advantages=advantages,
-                    clip_ratio_c=self.clip_ratio_c,
-                    clip_ratio_low=self.clip_ratio_low,
-                    clip_ratio_high=self.clip_ratio_high,
-                    loss_mask=mask,
-                    clip_log_ratio_min=self.cfg.algorithm.get(
-                        "clip_log_ratio_min", None
-                    ),
-                    clip_log_ratio_max=self.cfg.algorithm.get(
-                        "clip_log_ratio_max", None
-                    ),
-                    fast_path_zero_loss_mask=True,
-                )
+                    if self.cfg.algorithm.get("importance_sampling_fix", False):
+                        if (
+                            "rollout_logprobs" not in batch
+                            or "recomputed_logprobs" not in batch
+                        ):
+                            raise ValueError(
+                                "importance_sampling_fix requires both rollout_logprobs and recomputed_logprobs"
+                            )
+                        advantages, _, _ = apply_importance_sampling_correction(
+                            advantages,
+                            batch["recomputed_logprobs"],
+                            batch["rollout_logprobs"],
+                            self.cfg.algorithm.importance_sampling_clip,
+                        )
+
+                    mask = batch["response_mask"][:, -response_len:]
+
+                    loss, metrics_data = policy_loss(
+                        task_type=self.cfg.runner.task_type,
+                        loss_type=self.cfg.algorithm.loss_type,
+                        loss_agg_func=self.loss_agg_func,
+                        logprobs=curr_logprobs,
+                        old_logprobs=old_logprobs,
+                        advantages=advantages,
+                        clip_ratio_c=self.clip_ratio_c,
+                        clip_ratio_low=self.clip_ratio_low,
+                        clip_ratio_high=self.clip_ratio_high,
+                        loss_mask=mask,
+                        clip_log_ratio_min=self.cfg.algorithm.get(
+                            "clip_log_ratio_min", None
+                        ),
+                        clip_log_ratio_max=self.cfg.algorithm.get(
+                            "clip_log_ratio_max", None
+                        ),
+                        fast_path_zero_loss_mask=True,
+                    )
+
+                if self.distillation_plan.enabled:
+                    loss, distill_metrics = combine_actor_distillation(
+                        self, output, batch, loss, dynamic=False
+                    )
+                    metrics_data.update(distill_metrics)
 
                 entropy_loss = torch.zeros(1, device=loss.device)
                 if self.calculate_entropy:
@@ -269,32 +420,36 @@ class MegatronActor(MegatronWorker):
                     loss = loss + kl_loss * self.kl_beta
 
                 # Logging and early stopping according to KL (logp vs ref) or importance ratio (new logp vs old logp).
-                _imp: torch.Tensor = metrics_data["actor/ratio"].clone()
-                torch.distributed.all_reduce(
-                    _imp,
-                    torch.distributed.ReduceOp.AVG,
-                    group=parallel_state.get_data_parallel_group(),
-                )
-
-                # Early stopping.
-                if (
-                    self.cfg.algorithm.early_stop_imp_ratio is not None
-                    and _imp > self.cfg.algorithm.early_stop_imp_ratio
-                ):
-                    self.log_warning(
-                        f"Current importance ratio {_imp.item():.4f} is larger "
-                        f"than early stop threshold {self.cfg.algorithm.early_stop_imp_ratio}. Abandon this microbatch."
+                if "actor/ratio" in metrics_data:
+                    _imp: torch.Tensor = metrics_data["actor/ratio"].clone()
+                    torch.distributed.all_reduce(
+                        _imp,
+                        torch.distributed.ReduceOp.AVG,
+                        group=parallel_state.get_data_parallel_group(),
                     )
-                    loss = loss * 0.0
 
-                if self.cfg.algorithm.use_valid_token_scale:
-                    loss_scale = (
-                        mask.sum()
-                        / self.global_valid_token
-                        * parallel_state.get_data_parallel_world_size()
-                        * self.num_microbatches
-                    )
-                    loss *= loss_scale.item()
+                    # Early stopping.
+                    if (
+                        self.cfg.algorithm.early_stop_imp_ratio is not None
+                        and _imp > self.cfg.algorithm.early_stop_imp_ratio
+                    ):
+                        self.log_warning(
+                            f"Current importance ratio {_imp.item():.4f} is larger "
+                            f"than early stop threshold {self.cfg.algorithm.early_stop_imp_ratio}. Abandon this microbatch."
+                        )
+                        loss = loss * 0.0
+
+                    if (
+                        self.cfg.algorithm.use_valid_token_scale
+                        and not self.distillation_plan.enabled
+                    ):
+                        loss_scale = (
+                            mask.sum()
+                            / self.global_valid_token
+                            * parallel_state.get_data_parallel_world_size()
+                            * self.num_microbatches
+                        )
+                        loss *= loss_scale.item()
 
                 # add to log
                 metrics_data.update(

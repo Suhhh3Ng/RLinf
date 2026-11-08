@@ -51,6 +51,30 @@ class _LazyParallelState:
 parallel_state = _LazyParallelState()
 
 
+def compute_distillation_rollout_metrics(batch, group=None):
+    """Report lengths and optional observed rewards without task advantages."""
+    device = batch["input_ids"].device
+    sizes = []
+    for key in ("prompt_lengths", "response_lengths"):
+        gathered = [None] * torch.distributed.get_world_size(group)
+        torch.distributed.all_gather_object(
+            gathered, batch[key].cpu().tolist(), group=group
+        )
+        sizes.append(
+            torch.tensor([value for part in gathered for value in part], device=device)
+        )
+    metrics = {
+        "prompt_length/mean": sizes[0].float().mean(),
+        "response_length/mean": sizes[1].float().mean(),
+    }
+    if "rewards" in batch:
+        reward = batch["rewards"].float()
+        stats = torch.stack((reward.sum(), reward.new_tensor(reward.numel())))
+        torch.distributed.all_reduce(stats, group=group)
+        metrics["rewards/mean"] = stats[0] / stats[1].clamp_min(1)
+    return metrics, sizes[0], sizes[1]
+
+
 def compute_rollout_metrics_dynamic(
     rollout_batch: dict[str, torch.Tensor],
     max_prompt_len: int,
@@ -76,6 +100,9 @@ def compute_rollout_metrics_dynamic(
     Returns:
         Tuple of (rollout_metrics dict, total_prompt_lengths tensor, total_decode_lengths tensor)
     """
+    if "advantages" not in rollout_batch:
+        return compute_distillation_rollout_metrics(rollout_batch, data_parallel_group)
+
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
     # Extract basic tensors
@@ -221,6 +248,9 @@ def compute_rollout_metrics(
     data_parallel_group: Optional[ProcessGroup] = None,
     use_critic: bool = False,
 ):
+    if "advantages" not in rollout_batch:
+        return compute_distillation_rollout_metrics(rollout_batch, data_parallel_group)
+
     device = Worker.torch_platform.current_device()
     advantages = rollout_batch["advantages"].to(device=device)
     mask = rollout_batch["response_mask"][:, -response_len:].to(device=device)
@@ -585,9 +615,12 @@ class RolloutDataBalance(UserDict):
                     and full_tensor.size(0) == global_total_samples
                 ):
                     try:
-                        final_rank_data[key] = full_tensor.index_select(
-                            0, indices_cpu
-                        ).to(current_device)
+                        selected = full_tensor.index_select(0, indices_cpu)
+                        final_rank_data[key] = (
+                            selected
+                            if key == "teacher_logprobs"
+                            else selected.to(current_device)
+                        )
                     except IndexError:
                         final_rank_data[key] = _create_empty_tensor_for_key(
                             key, template_specs, current_device

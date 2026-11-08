@@ -18,12 +18,18 @@ import torch
 from omegaconf import DictConfig
 
 import rlinf.algorithms  # noqa: F401
+from rlinf.algorithms.distillation.losses import (
+    DistillationReductionContext,
+    combine_distillation_and_task_loss,
+    compute_distillation_loss,
+)
 from rlinf.algorithms.registry import (
     calculate_adv_and_returns,
     get_loss_scales,
     policy_loss,
 )
 from rlinf.algorithms.utils import (
+    apply_importance_sampling_correction,
     kl_penalty,
 )
 from rlinf.data.schema.reasoning_results import (
@@ -52,6 +58,7 @@ from rlinf.utils.utils import (
     cpu_dict,
     cpu_weight_swap,
 )
+from rlinf.workers.actor.distillation import fsdp_distillation_forward
 from rlinf.workers.actor.fsdp_actor_worker import (
     FSDPActor,
 )
@@ -118,6 +125,9 @@ class MAFSDPActor(FSDPActor):
         self,
         m_batch: dict[str, torch.Tensor],
         calculate_entropy: bool = False,
+        *,
+        distillation: bool = False,
+        select_ids: bool = False,
     ) -> torch.Tensor:
         input_ids = m_batch["input_ids"]
         attention_mask = m_batch["attention_mask"]
@@ -169,6 +179,31 @@ class MAFSDPActor(FSDPActor):
 
         logits: torch.Tensor = outputs.logits
         logits.div_(self.cfg.algorithm.sampling_params.temperature)
+
+        if distillation:
+            packed = self.enable_dynamic_batch_size
+            if packed:
+                starts, ends = idx_starts, idx_ends
+            else:
+                lengths = m_batch["attention_mask"].sum(-1).tolist()
+                starts = (
+                    [0] * len(lengths)
+                    if True
+                    else (
+                        self.cfg.data.max_prompt_length - m_batch["prompt_lengths"]
+                    ).tolist()
+                )
+                ends = [int(a) + int(n) for a, n in zip(starts, lengths)]
+            return fsdp_distillation_forward(
+                self,
+                logits,
+                m_batch,
+                packed=packed,
+                starts=starts,
+                ends=ends,
+                response_only=False,
+                select_ids=select_ids,
+            )
 
         if self.enable_dynamic_batch_size:
             # unpack_fsdp_logprobs is expected to return logprobs unpacked to
@@ -367,45 +402,110 @@ class MAFSDPActor(FSDPActor):
         )
         for k, v in m_batch.items():
             m_batch[k] = (
-                v.to(Worker.torch_device_type) if isinstance(v, torch.Tensor) else v
+                v.to(Worker.torch_device_type)
+                if isinstance(v, torch.Tensor) and k != "teacher_logprobs"
+                else v
             )
 
         # batch for forward
-        logprobs, entropy = self.forward_batch(m_batch, True)
-
-        # batch for backward
-        old_logprobs = m_batch.get("recomputed_logprobs")
-        if old_logprobs is None:
-            old_logprobs = m_batch["rollout_logprobs"]
-        advantages = m_batch["advantages"] * m_batch["loss_scales"]
-        ref_logprobs = None
-        if "ref_logprobs" in m_batch:
-            ref_logprobs = m_batch["ref_logprobs"]
+        distillation_forward = None
+        if self.distillation_plan.enabled:
+            distillation_forward = self.forward_training_batch(m_batch)
+            logprobs, entropy = (
+                distillation_forward.logprobs,
+                distillation_forward.entropy,
+            )
+        else:
+            logprobs, entropy = self.forward_batch(m_batch, True)
 
         loss_mask = self.get_response_loss_mask(m_batch)
+        ref_logprobs = m_batch.get("ref_logprobs")
+        loss = None
+        mbs_metrics_data = {}
+        if (
+            not self.distillation_plan.enabled
+            or self.distillation_plan.need_task_advantages
+        ):
+            # batch for backward
+            old_logprobs = m_batch.get("recomputed_logprobs")
+            if old_logprobs is None:
+                old_logprobs = m_batch["rollout_logprobs"]
+            advantages = m_batch["advantages"] * m_batch["loss_scales"]
+            ref_logprobs = None
+            if "ref_logprobs" in m_batch:
+                ref_logprobs = m_batch["ref_logprobs"]
 
-        clip_ratio = self.cfg.algorithm.ratio_clip_eps
-        clip_ratio_low = self.cfg.algorithm.get("clip_ratio_low", None)
-        clip_ratio_high = self.cfg.algorithm.get("clip_ratio_high", None)
-        clip_ratio_low = clip_ratio_low if clip_ratio_low is not None else clip_ratio
-        clip_ratio_high = clip_ratio_high if clip_ratio_high is not None else clip_ratio
-        clip_ratio_c = self.cfg.algorithm.get("clip_ratio_c", 3.0)
+            loss_mask = self.get_response_loss_mask(m_batch)
 
-        loss, mbs_metrics_data = policy_loss(
-            task_type=self.task_type,
-            loss_type=self.cfg.algorithm.loss_type,
-            loss_agg_func=self.loss_agg_func,
-            logprobs=logprobs,
-            old_logprobs=old_logprobs,
-            advantages=advantages,
-            clip_ratio_c=clip_ratio_c,
-            clip_ratio_low=clip_ratio_low,
-            clip_ratio_high=clip_ratio_high,
-            loss_mask=loss_mask,
-            clip_log_ratio_min=self.cfg.algorithm.get("clip_log_ratio_min", None),
-            clip_log_ratio_max=self.cfg.algorithm.get("clip_log_ratio_max", None),
-            fast_path_zero_loss_mask=True,
-        )
+            clip_ratio = self.cfg.algorithm.ratio_clip_eps
+            clip_ratio_low = self.cfg.algorithm.get("clip_ratio_low", None)
+            clip_ratio_high = self.cfg.algorithm.get("clip_ratio_high", None)
+            clip_ratio_low = (
+                clip_ratio_low if clip_ratio_low is not None else clip_ratio
+            )
+            clip_ratio_high = (
+                clip_ratio_high if clip_ratio_high is not None else clip_ratio
+            )
+            clip_ratio_c = self.cfg.algorithm.get("clip_ratio_c", 3.0)
+
+            loss, mbs_metrics_data = policy_loss(
+                task_type=self.task_type,
+                loss_type=self.cfg.algorithm.loss_type,
+                loss_agg_func=self.loss_agg_func,
+                logprobs=logprobs,
+                old_logprobs=old_logprobs,
+                advantages=advantages,
+                clip_ratio_c=clip_ratio_c,
+                clip_ratio_low=clip_ratio_low,
+                clip_ratio_high=clip_ratio_high,
+                loss_mask=loss_mask,
+                clip_log_ratio_min=self.cfg.algorithm.get("clip_log_ratio_min", None),
+                clip_log_ratio_max=self.cfg.algorithm.get("clip_log_ratio_max", None),
+                fast_path_zero_loss_mask=True,
+            )
+
+        if self.distillation_plan.enabled:
+            aligned_batch = dict(m_batch)
+            if self.distillation_plan.use_policy_gradient and self.cfg.algorithm.get(
+                "importance_sampling_fix", False
+            ):
+                old = m_batch["recomputed_logprobs"]
+                weights, _, _ = apply_importance_sampling_correction(
+                    torch.ones_like(old),
+                    old,
+                    m_batch["rollout_logprobs"],
+                    self.cfg.algorithm.importance_sampling_clip,
+                )
+                aligned_batch["rollout_is_weights"] = weights
+
+            aligned_batch["response_mask"] = loss_mask
+            aligned_batch["teacher_valid_mask"] = m_batch["teacher_valid_mask"].to(
+                loss_mask.device
+            )
+            # Sampled targets are small; full targets were consumed in token chunks.
+            if self.distillation_plan.target_format == "sampled":
+                aligned_batch["teacher_logprobs"] = m_batch["teacher_logprobs"].to(
+                    loss_mask.device
+                )
+            distill_loss, distill_metrics = compute_distillation_loss(
+                distillation_forward,
+                aligned_batch,
+                plan=self.distillation_plan,
+                config=self.distillation_loss_config,
+                reduction=DistillationReductionContext(
+                    self._distillation_denominator,
+                    mode=self.cfg.algorithm.loss_agg_func,
+                    dp_size=self._world_size,
+                    gradient_divisor=self.gradient_accumulation,
+                ),
+            )
+            loss = combine_distillation_and_task_loss(
+                loss,
+                distill_loss,
+                use_task_rewards=self.distillation_plan.need_task_rewards,
+                coefficient=self.distillation_loss_config.distillation_loss_coef,
+            )
+            mbs_metrics_data.update(distill_metrics)
 
         entropy_loss = torch.tensor(0.0, device=Worker.torch_platform.current_device())
         if self.calculate_entropy:
@@ -492,7 +592,7 @@ class MAFSDPActor(FSDPActor):
         assert not do_offload, (
             "do_offload argument of run_inference/run_training is not supported in FSDP for now"
         )
-        assert not self.is_pipeline, (
+        assert not self.is_pipeline or self.distillation_plan.enabled, (
             "MAFSDPActor currently only supports collocated training"
         )
 
@@ -506,16 +606,23 @@ class MAFSDPActor(FSDPActor):
             batches,
             self.cfg.algorithm.group_size,
         )
-        assert (
-            "recomputed_logprobs" in global_batch or "rollout_logprobs" in global_batch
-        )
+        if self.distillation_plan.enabled:
+            global_batch = self.prepare_distillation_targets(global_batch)
+        if self.distillation_plan.need_old_logprobs:
+            assert (
+                "recomputed_logprobs" in global_batch
+                or "rollout_logprobs" in global_batch
+            )
 
         global_batch = self.compute_advantages_and_returns(global_batch)
         global_batch["loss_scales"] = torch.ones_like(
-            global_batch["advantages"]
+            global_batch["response_mask"], dtype=torch.float32
         ).masked_fill(~global_batch["response_mask"], 0)
 
-        if self.cfg.algorithm.normalize_advantages:
+        if (
+            self.distillation_plan.need_task_advantages
+            and self.cfg.algorithm.normalize_advantages
+        ):
             raise AssertionError(
                 "normalize_advantages is not implemented in multi-agent"
             )
@@ -534,6 +641,14 @@ class MAFSDPActor(FSDPActor):
         }
         for loss_scale_fn in self.loss_scale_fns:
             global_batch = loss_scale_fn(scale_context, global_batch)
+        if self.distillation_plan.enabled:
+            global_batch["distillation_loss_scales"] = global_batch[
+                "loss_scales"
+            ].clone()
+            if self.distillation_plan.need_task_advantages:
+                global_batch["distillation_loss_scales"] *= scale_context.get(
+                    "distillation_group_scale", 1.0
+                )
         if self.pack_traj:
             global_batch = DynamicRolloutResult.pack_traj_batch(
                 scale_context, global_batch
@@ -548,6 +663,7 @@ class MAFSDPActor(FSDPActor):
             batch_pad = DynamicRolloutResult.get_batch_pad(
                 self.cfg.actor.model.encoder_seq_length,
                 list(global_batch.keys()),
+                batch_template=global_batch,
             )
             global_batch = self._dp_load_balance_dynamic(
                 global_batch,
@@ -583,6 +699,12 @@ class MAFSDPActor(FSDPActor):
         Args:
             batch (Dict[str, torch.Tensor]): The rollout batch.
         """
+        if (
+            self.distillation_plan.enabled
+            and not self.distillation_plan.need_task_advantages
+        ):
+            return batch
+
         with self.worker_timer():
             if batch.get("advantages", None) is None:
                 mask = batch["response_mask"]

@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 import torch
 from omegaconf import DictConfig
 
+from rlinf.data.schema.distillation import TeacherTargets, teacher_targets_to_batch
 from rlinf.scheduler import Worker
 from rlinf.utils.data_iter_utils import (
     get_iterator_k_split,
@@ -40,6 +41,8 @@ from rlinf.data.schema.reasoning_requests import SeqGroupInfo, get_batch_size
 class RolloutResult:
     """Container for reasoning rollout sequences and training metadata."""
 
+    teacher_targets: list[TeacherTargets] | None = None
+    teacher_requests: list | None = None
     num_sequence: int
     group_size: int
     prompt_lengths: list[int]
@@ -238,7 +241,7 @@ class RolloutResult:
 
     @classmethod
     def from_sglang_seq_group(cls, seq_group: SeqGroupInfo, return_logprobs: bool):
-        return cls.from_sglang_results(
+        result = cls.from_sglang_results(
             seq_group.results,
             seq_group.group_size,
             [seq_group.input_ids] * seq_group.group_size,
@@ -248,15 +251,23 @@ class RolloutResult:
             return_logprobs=return_logprobs,
         )
 
+        result.teacher_targets = seq_group.teacher_targets
+        result.teacher_requests = seq_group.teacher_requests
+        return result
+
     @classmethod
     def from_vllm_seq_group(cls, seq_group: SeqGroupInfo, return_logprobs: bool):
-        return cls.from_vllm_results(
+        result = cls.from_vllm_results(
             seq_group.group_size,
             seq_group.results,
             answers=[seq_group.answer] * seq_group.group_size,
             multi_modal_inputs=[seq_group.multi_modal_inputs] * seq_group.group_size,
             return_logprobs=return_logprobs,
         )
+
+        result.teacher_targets = seq_group.teacher_targets
+        result.teacher_requests = seq_group.teacher_requests
+        return result
 
     @staticmethod
     def merge_result_list(
@@ -275,6 +286,22 @@ class RolloutResult:
             is_end=[],
         )
 
+        request_presence = [res.teacher_requests is not None for res in rollout_results]
+        if any(request_presence) and not all(request_presence):
+            raise ValueError(
+                "Cannot merge pending Student top-k requests with other rollout modes"
+            )
+        if all(request_presence):
+            merged_result.teacher_requests = [
+                request for res in rollout_results for request in res.teacher_requests
+            ]
+        presence = [res.teacher_targets is not None for res in rollout_results]
+        if any(presence) and not all(presence):
+            raise ValueError("Cannot merge scored and unscored rollout results")
+        if all(presence):
+            merged_result.teacher_targets = [
+                target for res in rollout_results for target in res.teacher_targets
+            ]
         for res in rollout_results:
             merged_result.prompt_lengths.extend(res.prompt_lengths)
             merged_result.prompt_ids.extend(res.prompt_ids)
@@ -461,6 +488,16 @@ class RolloutResult:
         # Create split RolloutResult objects
         for i in range(num_groups):
             split_result = RolloutResult(
+                teacher_requests=rollout_result.teacher_requests[
+                    i * group_size : (i + 1) * group_size
+                ]
+                if rollout_result.teacher_requests is not None
+                else None,
+                teacher_targets=rollout_result.teacher_targets[
+                    i * group_size : (i + 1) * group_size
+                ]
+                if rollout_result.teacher_targets is not None
+                else None,
                 num_sequence=group_size,
                 group_size=group_size,
                 prompt_lengths=prompt_lengths_split[i],
@@ -686,6 +723,18 @@ class RolloutResult:
             )
         if self.ref_logprobs is not None:
             batch["ref_logprobs"] = self.ref_logprobs.to(Worker.torch_device_type)
+        if self.teacher_requests is not None:
+            batch["teacher_requests"] = self.teacher_requests
+        if self.teacher_targets is not None:
+            batch.update(
+                teacher_targets_to_batch(
+                    self.teacher_targets,
+                    self.prompt_lengths,
+                    self.response_lengths,
+                    max_response_len,
+                    response_only=True,
+                )
+            )
         return batch
 
     @staticmethod
@@ -753,6 +802,8 @@ class RolloutResult:
             "response_texts",
             "rollout_logprobs",
             "response_mask",
+            "teacher_targets",
+            "teacher_requests",
         ]
         for k in list_fields:
             v = getattr(rollout_result, k)
@@ -806,6 +857,8 @@ class RolloutResult:
                 image_data=fields_split["image_data"][i],
                 multi_modal_inputs=fields_split["multi_modal_inputs"][i],
                 response_mask=fields_split["response_mask"][i],
+                teacher_targets=fields_split["teacher_targets"][i],
+                teacher_requests=fields_split["teacher_requests"][i],
                 rollout_logprobs=fields_split["rollout_logprobs"][i],
                 recomputed_logprobs=fields_split["recomputed_logprobs"][i],
                 ref_logprobs=fields_split["ref_logprobs"][i],
@@ -824,6 +877,8 @@ class DynamicRolloutResult:
     Only supports right padding
     """
 
+    teacher_targets: list[TeacherTargets] | None = None
+    teacher_requests: list | None = None
     num_sequence: int
     group_size: int
 
@@ -990,11 +1045,24 @@ class DynamicRolloutResult:
         if self.ref_logprobs is not None:
             batch["ref_logprobs"] = self.ref_logprobs.cuda()
 
+        if self.teacher_requests is not None:
+            batch["teacher_requests"] = self.teacher_requests
+        if self.teacher_targets is not None:
+            batch.update(
+                teacher_targets_to_batch(
+                    self.teacher_targets,
+                    self.prompt_lengths,
+                    self.response_lengths,
+                    seq_length,
+                    response_only=False,
+                )
+            )
         return batch
 
     def get_batch_pad(
         seq_length: int,
         available_keys: list[str],
+        batch_template: dict[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Get the batch pad for the dynamic rollout result."""
 
@@ -1042,6 +1110,11 @@ class DynamicRolloutResult:
                 *pad_seq_shape, dtype=torch.float32, device=torch.cuda.current_device()
             ),
         }
+        if batch_template is not None:
+            for key in available_keys:
+                if key.startswith("teacher_") or key == "distillation_loss_scales":
+                    value = batch_template[key]
+                    batch_pad[key] = value.new_zeros((1, *value.shape[1:]))
         batch_pad = {k: v for k, v in batch_pad.items() if k in available_keys}
         return batch_pad
 
@@ -1155,7 +1228,9 @@ class DynamicRolloutResult:
                         batch["response_mask"][left],
                         batch["response_mask"][right],
                     )
-                    if mask_overlap.sum().item() > 1:
+                    if mask_overlap.sum().item() > (
+                        0 if "teacher_valid_mask" in batch else 1
+                    ):
                         continue
                     left_ids = batch["input_ids"][left][
                         : prompt_lengths[left] + response_lengths[left]
@@ -1185,6 +1260,10 @@ class DynamicRolloutResult:
             "rewards",
             "advantages",
             "loss_scales",
+            "distillation_loss_scales",
+            "teacher_logprobs",
+            "teacher_token_ids",
+            "teacher_valid_mask",
             *(k for k in batch.keys() if k.startswith("extra:")),
         ]
         custom_keys = [
@@ -1200,7 +1279,8 @@ class DynamicRolloutResult:
         for suffix, prefixes in pack_map.items():
             idxes = [*prefixes, suffix]
             assert len(idxes) >= 2
-            assert len({split_params["rewards"][idx].item() for idx in idxes}) == 1
+            if "rewards" in split_params:
+                assert len({split_params["rewards"][idx].item() for idx in idxes}) == 1
 
             # Merge additive token-level stats over response tokens only.
             for key in ["recomputed_logprobs", "rollout_logprobs", "advantages"]:
@@ -1214,19 +1294,33 @@ class DynamicRolloutResult:
                 ]
                 split_params[key][suffix] = torch.stack(value).sum(dim=0)
 
+            for key in ("teacher_logprobs", "teacher_token_ids", "teacher_valid_mask"):
+                if key not in split_params:
+                    continue
+                merged = torch.zeros_like(split_params[key][suffix])
+                for idx in idxes:
+                    span = split_params["response_mask"][idx].to(merged.device)
+                    if merged.ndim == 3:
+                        span = span.unsqueeze(-1)
+                    merged = torch.where(span, split_params[key][idx], merged)
+                split_params[key][suffix] = merged
+
             # Re-scale loss_scales to preserve total per-turn contribution.
             masked_counts = [
                 split_params["response_mask"][idx].sum().item() for idx in idxes
             ]
             masked_count_all = sum(masked_counts)
-            value = [
-                split_params["loss_scales"][idx].masked_fill(
-                    ~split_params["response_mask"][idx], 0
-                )
-                * (masked_count_all / masked_counts[i])
-                for i, idx in enumerate(idxes)
-            ]
-            split_params["loss_scales"][suffix] = torch.stack(value).sum(dim=0)
+            for scale_key in ("loss_scales", "distillation_loss_scales"):
+                if scale_key not in split_params:
+                    continue
+                value = [
+                    split_params[scale_key][idx].masked_fill(
+                        ~split_params["response_mask"][idx], 0
+                    )
+                    * (masked_count_all / max(masked_counts[i], 1))
+                    for i, idx in enumerate(idxes)
+                ]
+                split_params[scale_key][suffix] = torch.stack(value).sum(dim=0)
 
             response_mask = [split_params["response_mask"][idx] for idx in idxes]
             split_params["response_mask"][suffix] = (
@@ -1262,6 +1356,10 @@ class DynamicRolloutResult:
         folding_scale = context["folding_scale"]
         if "group_level" in folding_scale:
             packed_batch["loss_scales"] *= num_sequence_after / num_sequence
+            if "distillation_loss_scales" in packed_batch:
+                packed_batch["distillation_loss_scales"] *= (
+                    num_sequence_after / num_sequence
+                )
 
         return packed_batch
 
@@ -1297,6 +1395,22 @@ class DynamicRolloutResult:
             ),
         )
 
+        request_presence = [res.teacher_requests is not None for res in rollout_results]
+        if any(request_presence) and not all(request_presence):
+            raise ValueError(
+                "Cannot merge pending Student top-k requests with other rollout modes"
+            )
+        if all(request_presence):
+            merged_result.teacher_requests = [
+                request for res in rollout_results for request in res.teacher_requests
+            ]
+        presence = [res.teacher_targets is not None for res in rollout_results]
+        if any(presence) and not all(presence):
+            raise ValueError("Cannot merge scored and unscored rollout results")
+        if all(presence):
+            merged_result.teacher_targets = [
+                target for res in rollout_results for target in res.teacher_targets
+            ]
         for res in rollout_results:
             # Merge required list fields (size: num_sequence)
             merged_result.idx_to_traj.extend(res.idx_to_traj)
@@ -1378,7 +1492,11 @@ class DynamicRolloutResult:
             split_prompt_lengths = rollout_result.prompt_lengths[start_idx:end_idx]
             split_response_lengths = rollout_result.response_lengths[start_idx:end_idx]
             split_is_end = rollout_result.is_end[start_idx:end_idx]
-            split_rewards = rollout_result.rewards[start_idx:end_idx]
+            split_rewards = (
+                rollout_result.rewards[start_idx:end_idx]
+                if rollout_result.rewards is not None
+                else None
+            )
             if rollout_result.rollout_logprobs is not None:
                 split_rollout_logprobs = rollout_result.rollout_logprobs[
                     start_idx:end_idx
@@ -1402,6 +1520,12 @@ class DynamicRolloutResult:
 
             # construct the split DynamicRolloutResult
             split_result = DynamicRolloutResult(
+                teacher_requests=rollout_result.teacher_requests[start_idx:end_idx]
+                if rollout_result.teacher_requests is not None
+                else None,
+                teacher_targets=rollout_result.teacher_targets[start_idx:end_idx]
+                if rollout_result.teacher_targets is not None
+                else None,
                 num_sequence=split_size,
                 group_size=rollout_result.group_size,
                 idx_to_traj=split_idx_to_traj,

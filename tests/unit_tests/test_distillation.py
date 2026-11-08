@@ -1,0 +1,434 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Distillation values, gradients, masking and distributed normalization."""
+
+import tempfile
+import unittest
+from datetime import timedelta
+
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
+from rlinf.algorithms.distillation.config import (
+    DistillationLossConfig,
+    build_distillation_plan,
+)
+from rlinf.algorithms.distillation.fsdp import compute_distribution_loss
+from rlinf.algorithms.distillation.losses import (
+    DistillationReductionContext,
+    combine_distillation_and_task_loss,
+    compute_distillation_pg_tokens,
+    compute_distillation_tokens,
+)
+from rlinf.algorithms.distillation.megatron import (
+    compute_vocab_parallel_distribution_loss,
+    select_vocab_parallel_topk,
+)
+from rlinf.algorithms.losses import (
+    compute_ppo_actor_loss,
+    compute_ppo_actor_loss_tokens,
+)
+
+MODES = (
+    "forward_kl_topk",
+    "forward_kl_topk_tail",
+    "reverse_kl_topk",
+    "reverse_kl_topk_tail",
+)
+
+
+def reference(logits, teacher, ids, mode, eps=1e-6):
+    """Explicit probability distributions independent of the production kernels."""
+    logq = logits.log_softmax(-1)
+    logp = teacher.detach().log_softmax(-1)
+    p, q = logp.exp(), logq.exp()
+    if ids is not None:
+        outside = torch.ones_like(p, dtype=torch.bool).scatter(-1, ids, False)
+        pt = p.masked_fill(~outside, 0).sum(-1)
+        qt = q.masked_fill(~outside, 0).sum(-1)
+        p, q = p.gather(-1, ids), q.gather(-1, ids)
+        logp, logq = logp.gather(-1, ids), logq.gather(-1, ids)
+    reverse = mode.startswith("reverse")
+    loss = (q * (logq - logp) if reverse else p * (logp - logq)).sum(-1)
+    if ids is not None and ids.shape[-1] < logits.shape[-1] and mode.endswith("_tail"):
+        loss = loss + (
+            qt * (qt.log() - pt.clamp_min(eps).log())
+            if reverse
+            else pt * (pt.log() - qt.clamp_min(eps).log())
+        )
+    return loss.clamp_min(0) if mode == "forward_kl_topk" else loss
+
+
+def _tp_process(rank, path):
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{path}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        torch.manual_seed(29)
+        original = torch.randn(2, 3, 7)
+        for tied in (False, True):
+            scores = torch.ones_like(original) if tied else original
+            shard = torch.nn.functional.pad(scores, (0, 1), value=100)[
+                ..., rank * 4 : (rank + 1) * 4
+            ]
+            for k in (1, 5, 7):
+                selected = select_vocab_parallel_topk(shard, k, 7, dist.group.WORLD)
+                expected_ids = scores.argsort(dim=-1, descending=True, stable=True)[
+                    ..., :k
+                ]
+                torch.testing.assert_close(selected, expected_ids)
+        teacher = torch.randn_like(original)
+        mask = torch.tensor([[True, False, True], [True, True, False]])
+        for mode in MODES:
+            for k in (3, -1):
+                config = DistillationLossConfig(
+                    loss_mode=mode,
+                    use_policy_gradient=False,
+                    topk_source="student",
+                    topk=k,
+                )
+                ids = original.argsort(-1, descending=True)[..., :k] if k > 0 else None
+                expected_z = original.clone().requires_grad_()
+                expected = torch.where(
+                    mask, reference(expected_z, teacher, ids, mode), 0
+                )
+                expected.sum().backward()
+                local_z = (
+                    torch.nn.functional.pad(original, (0, 1), value=100)[
+                        ..., rank * 4 : (rank + 1) * 4
+                    ]
+                    .clone()
+                    .requires_grad_()
+                )
+                logp = teacher.log_softmax(-1)
+                targets = (
+                    logp.gather(-1, ids)
+                    if ids is not None
+                    else torch.nn.functional.pad(logp, (0, 1))[
+                        ..., rank * 4 : (rank + 1) * 4
+                    ]
+                )
+                actual = compute_vocab_parallel_distribution_loss(
+                    local_z,
+                    ids,
+                    targets,
+                    vocab_start=rank * 4,
+                    vocab_end=(rank + 1) * 4,
+                    vocab_size=7,
+                    tp_group=dist.group.WORLD,
+                    config=config,
+                    valid_mask=mask,
+                )
+                actual.distribution_losses.sum().backward()
+                torch.testing.assert_close(
+                    actual.distribution_losses, expected, atol=2e-6, rtol=2e-5
+                )
+                expected_grad = torch.nn.functional.pad(expected_z.grad, (0, 1))[
+                    ..., rank * 4 : (rank + 1) * 4
+                ]
+                torch.testing.assert_close(
+                    local_z.grad, expected_grad, atol=2e-6, rtol=2e-5
+                )
+    finally:
+        dist.destroy_process_group()
+
+
+class TestDistillation(unittest.TestCase):
+    def test_config_aliases_and_invalid_combinations(self):
+        for alias, canonical in [("kl", "k1"), ("mse", "k2"), ("low_var_kl", "k3")]:
+            self.assertEqual(
+                DistillationLossConfig(loss_mode=alias).canonical_loss_mode, canonical
+            )
+        for mode in ("kl", "k1"):
+            with self.assertRaises(ValueError):
+                DistillationLossConfig(loss_mode=mode, use_policy_gradient=False)
+        for k in (0, -2, True):
+            with self.assertRaises(ValueError):
+                DistillationLossConfig(loss_mode="forward_kl_topk", topk=k)
+        for mode in ("reverse_kl_topk", "reverse_kl_topk_tail"):
+            with self.assertRaises(ValueError):
+                DistillationLossConfig(loss_mode=mode, topk_source="teacher")
+            DistillationLossConfig(loss_mode=mode, topk=-1)
+        with self.assertRaises(ValueError):
+            DistillationLossConfig(
+                loss_mode="reverse_kl_topk_tail",
+                topk_source="student",
+                log_prob_min_clamp=-10,
+            )
+
+    def test_plan_dependencies_and_no_config_mutation(self):
+        import copy
+
+        cfg = {
+            "distillation": {
+                "enabled": True,
+                "teacher_models": {"default": {"model_path": "teacher"}},
+                "distillation_loss": {
+                    "loss_mode": "reverse_kl_topk_tail",
+                    "topk_source": "student",
+                    "use_policy_gradient": False,
+                },
+            }
+        }
+        before = copy.deepcopy(cfg)
+        plan = build_distillation_plan(cfg)
+        self.assertFalse(
+            plan.need_old_logprobs
+            or plan.need_task_advantages
+            or plan.need_current_logprobs
+        )
+        self.assertTrue(plan.need_student_topk_selection)
+        self.assertEqual(cfg, before)
+
+    def test_sampled_estimators_and_gradients(self):
+        for mode in ("k1", "k2", "abs", "k3", "kl", "mse", "low_var_kl"):
+            with self.subTest(mode=mode):
+                s = torch.tensor([-0.2, -2.0, -25.0], requires_grad=True)
+                t = torch.tensor([-1.0, -1.0, -0.1], requires_grad=True)
+                config = DistillationLossConfig(loss_mode=mode)
+                result = compute_distillation_tokens(s, t, config=config)
+                d = s - t.detach()
+                canonical = config.canonical_loss_mode
+                expected = {
+                    "k1": lambda: d,
+                    "k2": lambda: d.square() / 2,
+                    "abs": lambda: d.abs(),
+                    "k3": lambda: (
+                        (-d).clamp(-20, 20).exp() - (-d).clamp(-20, 20) - 1
+                    ).clamp(-10, 10),
+                }[canonical]()
+                torch.testing.assert_close(result, expected)
+                torch.testing.assert_close(
+                    torch.autograd.grad(result.sum(), s)[0],
+                    torch.autograd.grad(expected.sum(), s)[0],
+                )
+                self.assertIsNone(t.grad)
+
+    def test_distribution_values_and_gradients(self):
+        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        for device in devices:
+            for mode in MODES:
+                for k in (3, 7, -1):
+                    with self.subTest(device=device, mode=mode, k=k):
+                        torch.manual_seed(7)
+                        z = torch.randn(2, 4, 7, device=device, requires_grad=True)
+                        teacher = torch.randn_like(z, requires_grad=True)
+                        ids = (
+                            z.detach().argsort(-1, descending=True)[..., :k]
+                            if k > 0
+                            else None
+                        )
+                        scores = teacher.log_softmax(-1)
+                        if ids is not None:
+                            scores = scores.gather(-1, ids)
+                        config = DistillationLossConfig(
+                            loss_mode=mode,
+                            topk=k,
+                            topk_source="student",
+                            use_policy_gradient=False,
+                        )
+                        actual = compute_distribution_loss(
+                            z, ids, scores, config
+                        ).distribution_losses
+                        expected = reference(z, teacher, ids, mode)
+                        torch.testing.assert_close(
+                            actual, expected, atol=2e-6, rtol=2e-5
+                        )
+                        actual_grad, teacher_grad = torch.autograd.grad(
+                            actual.sum(),
+                            (z, teacher),
+                            retain_graph=True,
+                            allow_unused=True,
+                        )
+                        self.assertIsNone(teacher_grad)
+                        expected_grad = torch.autograd.grad(expected.sum(), z)[0]
+                        torch.testing.assert_close(
+                            actual_grad, expected_grad, atol=2e-6, rtol=2e-5
+                        )
+                        self.assertGreater(actual_grad.abs().sum().item(), 0)
+                        self.assertIsNone(teacher.grad)
+
+    def test_masked_nan_and_zero_microbatch(self):
+        for mode in MODES:
+            z = torch.full((2, 3, 7), float("nan"), requires_grad=True)
+            ids = torch.full((2, 3, 3), -99, dtype=torch.long)
+            teacher = torch.full((2, 3, 3), float("nan"))
+            config = DistillationLossConfig(
+                loss_mode=mode, topk=3, topk_source="student", use_policy_gradient=False
+            )
+            loss = compute_distribution_loss(
+                z, ids, teacher, config, valid_mask=torch.zeros(2, 3, dtype=torch.bool)
+            ).distribution_losses.sum()
+            loss.backward()
+            self.assertEqual(loss.item(), 0)
+            torch.testing.assert_close(z.grad, torch.zeros_like(z))
+
+    def test_duplicate_ids_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unique"):
+            compute_distribution_loss(
+                torch.zeros(1, 5),
+                torch.tensor([[1, 1]]),
+                torch.full((1, 2), -2.0),
+                DistillationLossConfig(loss_mode="forward_kl_topk", topk=2),
+            )
+
+    def test_reverse_tail_teacher_zero_mass(self):
+        z = torch.tensor([[0.3, -0.7, -1.2]], requires_grad=True)
+        teacher = torch.tensor([[0.0]])
+        config = DistillationLossConfig(
+            loss_mode="reverse_kl_topk_tail",
+            topk=1,
+            topk_source="student",
+            use_policy_gradient=False,
+        )
+        output = compute_distribution_loss(z, torch.tensor([[0]]), teacher, config)
+        self.assertGreater(output.tail_loss.item(), 0)
+        output.distribution_losses.sum().backward()
+        self.assertTrue(torch.isfinite(z.grad).all())
+
+    def test_pg_clipping_order_and_old_policy_detached(self):
+        s = torch.tensor([[0.0, 2.0, -2.0, 30.0]], requires_grad=True)
+        old = torch.zeros_like(s, requires_grad=True)
+        d = torch.tensor([[1.0, -2.0, 2.0, 0.5]], requires_grad=True)
+        weights = torch.tensor([[0.1, 2.0, 3.0, 0.4]])
+        cfg = DistillationLossConfig(loss_mode="k1")
+        actual, _ = compute_distillation_pg_tokens(
+            s, old, d, config=cfg, rollout_is_weights=weights
+        )
+        ratio = s.clamp(-20, 20).exp()
+        advantage = -d.detach()
+        base = torch.maximum(-advantage * ratio, -advantage * ratio.clamp(0.8, 1.28))
+        expected = (
+            torch.where(advantage < 0, torch.minimum(base, -advantage * 3), base)
+            * weights
+        )
+        torch.testing.assert_close(actual, expected)
+        expected_grad = torch.autograd.grad(expected.sum(), s, retain_graph=True)[0]
+        actual.sum().backward()
+        torch.testing.assert_close(s.grad, expected_grad)
+        self.assertIsNone(old.grad)
+        self.assertIsNone(d.grad)
+
+    def test_original_ppo_reduction_uses_same_token_contract(self):
+        s = torch.tensor([[0.0, 0.8, -1.0]], requires_grad=True)
+        old = torch.zeros_like(s)
+        advantage = torch.tensor([[1.0, -2.0, 0.3]])
+        mask = torch.tensor([[True, True, False]])
+        tokens, _ = compute_ppo_actor_loss_tokens(
+            s,
+            old,
+            advantage,
+            mask,
+            clip_ratio_low=0.2,
+            clip_ratio_high=0.2,
+            clip_ratio_c=3,
+        )
+        loss, _ = compute_ppo_actor_loss(
+            s, old, 0.2, 0.2, advantage, loss_mask=mask, clip_ratio_c=3
+        )
+        torch.testing.assert_close(loss, tokens[mask].mean())
+
+    def test_global_reduction_invariant_to_microbatch_and_dp_partition(self):
+        mask = torch.tensor(
+            [[True, True, False], [True, False, False], [True, True, True]]
+        )
+        x = torch.arange(9.0).reshape(3, 3).requires_grad_()
+        expected = x.square()[mask].mean()
+        context = DistillationReductionContext(
+            mask.sum().item(), dp_size=2, gradient_divisor=3
+        )
+        actual = (
+            sum(
+                context.reduce(x[i : i + 1].square(), mask[i : i + 1]) / 3
+                for i in range(3)
+            )
+            / 2
+        )
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(
+            torch.autograd.grad(actual, x)[0], torch.autograd.grad(expected, x)[0]
+        )
+        self.assertEqual(
+            combine_distillation_and_task_loss(
+                None, x.sum(), use_task_rewards=False, coefficient=10
+            ).item(),
+            x.sum().item(),
+        )
+
+    def test_sequence_reductions_and_empty_update(self):
+        mask = torch.tensor(
+            [[True, True, False], [True, False, False], [False, False, False]]
+        )
+        x = torch.arange(9.0).reshape(3, 3).requires_grad_()
+        for mode in ("seq-mean-token-mean", "seq-mean-token-sum"):
+            context = DistillationReductionContext(2, mode=mode)
+            actual = sum(
+                context.reduce(x[i : i + 1], mask[i : i + 1]) for i in range(3)
+            )
+            expected = (
+                (x[0, :2].mean() + x[1, 0]) / 2
+                if mode.endswith("token-mean")
+                else (x[0, :2].sum() + x[1, 0]) / 2
+            )
+            torch.testing.assert_close(actual, expected)
+        zero = DistillationReductionContext(0).reduce(
+            x.square(), torch.zeros_like(mask)
+        )
+        zero.backward()
+        self.assertEqual(zero.item(), 0)
+        torch.testing.assert_close(x.grad, torch.zeros_like(x))
+
+    def test_pure_distillation_metrics_without_task_fields(self):
+        from rlinf.utils.distributed import (
+            compute_rollout_metrics,
+            compute_rollout_metrics_dynamic,
+        )
+
+        batch = {
+            "input_ids": torch.ones(2, 5, dtype=torch.long),
+            "prompt_lengths": torch.tensor([1, 2]),
+            "response_lengths": torch.tensor([3, 2]),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            dist.init_process_group(
+                "gloo", init_method=f"file://{directory}/init", rank=0, world_size=1
+            )
+            try:
+                for function in (
+                    compute_rollout_metrics,
+                    compute_rollout_metrics_dynamic,
+                ):
+                    metrics, prompts, responses = function(batch, 2, 3)
+                    self.assertEqual(metrics["prompt_length/mean"].item(), 1.5)
+                    self.assertEqual(metrics["response_length/mean"].item(), 2.5)
+                    self.assertNotIn("rewards/mean", metrics)
+                    self.assertEqual(prompts.tolist(), [1, 2])
+                    self.assertEqual(responses.tolist(), [3, 2])
+            finally:
+                dist.destroy_process_group()
+
+    def test_two_rank_vocab_parallel_values_and_gradients(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mp.spawn(_tp_process, args=(directory + "/init",), nprocs=2, join=True)
+
+
+if __name__ == "__main__":
+    unittest.main()
