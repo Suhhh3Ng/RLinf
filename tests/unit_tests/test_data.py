@@ -3860,7 +3860,8 @@ def test_downsampling_preserves_teacher_alignment(pending):
         teacher_requests=requests if pending else None,
     )
     result = down_sample_batch(rr, {"reject_equal_reward": True})
-    assert result.num_sequence == len(result.prompt_ids) == 2
+    assert result.num_sequence == 4
+    assert len(result.prompt_ids) == 2
     if pending:
         assert [r.request_id for r in result.teacher_requests] == ["2", "3"]
     else:
@@ -3875,3 +3876,47 @@ def test_downsampling_preserves_teacher_alignment(pending):
         torch.testing.assert_close(
             batch["teacher_logprobs"], torch.tensor([[[-3.0]], [[-4.0]]])
         )
+
+
+@pytest.mark.parametrize(
+    ("down_sample_to_n", "reject_equal", "retained"),
+    [(16, False, 16), (16, True, 0), (-1, False, 32)],
+)
+def test_downsampling_preserves_receive_quota(down_sample_to_n, reject_equal, retained):
+    from rlinf.data.schema.reasoning_results import RolloutResult
+    from rlinf.utils.down_sampling import down_sample_batch
+
+    results = []
+    original_count = 0
+    for _ in range(2):
+        result = RolloutResult(
+            num_sequence=32,
+            group_size=32,
+            prompt_lengths=[1] * 32,
+            prompt_ids=[[1]] * 32,
+            response_lengths=[1] * 32,
+            response_ids=[[2]] * 32,
+            is_end=[True] * 32,
+            rewards=[0.0] * 32 if reject_equal else [0.0] * 16 + [1.0] * 16,
+            response_texts=["<answer>ok</answer>"] * 32,
+        )
+        original_count += result.num_sequence
+        results.append(
+            down_sample_batch(
+                result,
+                {
+                    "down_sample_to_n": down_sample_to_n,
+                    "reject_equal_reward": reject_equal,
+                    "roc_error_ratio": True,
+                    "roc_answer_format": True,
+                },
+            )
+        )
+        assert result.num_sequence == 32
+        assert len(result.prompt_ids) == retained
+
+    assert sum(result.num_sequence for result in results) == original_count
+    merged = RolloutResult.merge_result_list(results)
+    assert merged.num_sequence == original_count
+    assert len(merged.prompt_ids) == len(merged.response_ids) == 2 * retained
+    assert merged.rewards.numel() == 2 * retained

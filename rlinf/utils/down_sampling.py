@@ -21,6 +21,8 @@ from rlinf.data.schema.reasoning_results import RolloutResult
 
 
 def down_sample_batch(rollout_result: RolloutResult, down_sampling_config: dict):
+    """Filter training data, preserving num_sequence for downstream receive quotas."""
+
     def _build_group_uids_by_chunks(total_num: int, group_size: int):
         return [i // max(1, group_size) for i in range(total_num)]
 
@@ -200,7 +202,6 @@ def down_sample_batch(rollout_result: RolloutResult, down_sampling_config: dict)
         rr.teacher_targets = _apply_mask_to_list(rr.teacher_targets, idx_mask)
     if rr.teacher_requests is not None:
         rr.teacher_requests = _apply_mask_to_list(rr.teacher_requests, idx_mask)
-    rr.num_sequence = int(idx_mask.sum().item())
 
     _dsn = int(down_sampling_config.get("down_sample_to_n", -1))
     if _dsn > 0:
