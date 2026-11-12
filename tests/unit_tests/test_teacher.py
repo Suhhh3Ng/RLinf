@@ -16,9 +16,13 @@
 
 import asyncio
 import os
+import sys
+import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -26,6 +30,7 @@ from rlinf.algorithms.distillation.config import TeacherModelConfig
 from rlinf.data.schema.distillation import TeacherScoreRequest, teacher_targets_to_batch
 from rlinf.workers.teacher.backend import TeacherModelInfo, tokenizer_fingerprint
 from rlinf.workers.teacher.client import TeacherClient, TeacherEndpoint
+from rlinf.workers.teacher.sglang_backend import SGLangTeacherBackend
 from rlinf.workers.teacher.vllm_backend import VLLMTeacherBackend
 
 
@@ -55,6 +60,122 @@ class TestTeacher(unittest.TestCase):
         self.rows = [None] + [
             {i: float(value.log()) for i, value in enumerate(row)} for row in self.probs
         ]
+
+    def test_tokenizer_padding_normalization_preserves_identity(self):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import AutoTokenizer, GPT2Config, PreTrainedTokenizerFast
+
+        from rlinf.models.tokenization import hf_tokenizer
+
+        with tempfile.TemporaryDirectory() as path:
+            tokenizer = PreTrainedTokenizerFast(
+                tokenizer_object=Tokenizer(WordLevel({f"t{i}": i for i in range(5)})),
+                eos_token="t2",
+            )
+            tokenizer.save_pretrained(path)
+            GPT2Config(vocab_size=8).save_pretrained(path)
+            raw = AutoTokenizer.from_pretrained(path)
+            actor = hf_tokenizer(path)
+            backend = VLLMTeacherBackend(TeacherModelConfig(path), "default")
+            info = backend.load_model_info()
+            self.assertEqual(tokenizer_fingerprint(raw), info.tokenizer_fingerprint)
+            self.assertEqual(tokenizer_fingerprint(actor), info.tokenizer_fingerprint)
+            self.assertIsNone(raw.pad_token)
+            raw.pad_token = "t3"
+            self.assertNotEqual(tokenizer_fingerprint(raw), info.tokenizer_fingerprint)
+            raw.pad_token = "t2"
+            raw.add_tokens(["new-token"])
+            self.assertNotEqual(tokenizer_fingerprint(raw), info.tokenizer_fingerprint)
+
+    def test_scoring_budget_includes_intermediate_objects(self):
+        backend = VLLMTeacherBackend(
+            TeacherModelConfig(
+                "unused", inference={"max_payload_bytes": 2 * 1024 * 1024}
+            ),
+            "default",
+        )
+        backend.info = TeacherModelInfo("model", "tokenizer", 150000, 32)
+        selected = request(2, ((0, 0), (4, 0), (2, 3)))
+        with self.assertRaisesRegex(ValueError, "scoring payload"):
+            backend.validate_request(selected)
+        with self.assertRaisesRegex(ValueError, "scoring payload"):
+            backend.validate_request(request(-1))
+
+    def test_selected_scores_use_original_prefixes_and_bounded_output(self):
+        calls = []
+        probabilities = self.probs
+
+        class VLLMEngine:
+            async def generate(self, prompt, params, request_id):
+                prefix = prompt["prompt_token_ids"]
+                calls.append(prefix)
+                # Prompt-wide vocabulary scores must never be requested here.
+                if hasattr(params, "prompt_logprobs"):
+                    raise AssertionError("Expected next-token scoring only")
+                assert params.max_tokens == 1
+                row = probabilities[len(prefix) - 1]
+                yield SimpleNamespace(
+                    outputs=[
+                        SimpleNamespace(
+                            logprobs=[
+                                {
+                                    i: SimpleNamespace(logprob=float(value.log()))
+                                    for i, value in enumerate(row)
+                                }
+                            ]
+                        )
+                    ]
+                )
+
+        class SGLangEngine:
+            async def async_generate(self, **kwargs):
+                prefix = kwargs["input_ids"]
+                calls.append(prefix)
+                assert kwargs["logprob_start_len"] == -1
+                assert kwargs["top_logprobs_num"] == 0
+                row = probabilities[len(prefix) - 1]
+                return {
+                    "meta_info": {
+                        "output_token_ids_logprobs": [
+                            [
+                                (float(row[i].log()), i, None)
+                                for i in kwargs["token_ids_logprob"]
+                            ]
+                        ]
+                    }
+                }
+
+        ids = ((0, 0), (4, 0), (2, 3))
+        req = request(2, ids)
+        modules = {
+            "vllm": SimpleNamespace(SamplingParams=SimpleNamespace),
+            "vllm.inputs": SimpleNamespace(TokensPrompt=dict),
+        }
+        for backend_cls, engine in (
+            (VLLMTeacherBackend, VLLMEngine()),
+            (SGLangTeacherBackend, SGLangEngine()),
+        ):
+            with (
+                self.subTest(backend=backend_cls.__name__),
+                patch.dict(sys.modules, modules),
+            ):
+                calls.clear()
+                backend = backend_cls(TeacherModelConfig("unused"), "default")
+                backend.info = self.backend.info
+                backend.engine = engine
+                target = asyncio.run(backend.score(req))
+                self.assertEqual(calls, [[1], [1, 3]])
+                self.assertEqual(target.token_ids[1:].tolist(), [[4, 0], [2, 3]])
+                torch.testing.assert_close(
+                    target.logprobs[1:],
+                    torch.stack((self.probs[0, [4, 0]], self.probs[1, [2, 3]])).log(),
+                )
+                calls.clear()
+                masked = replace(req, response_mask=(False, False, True))
+                target = asyncio.run(backend.score(masked))
+                self.assertEqual(calls, [[1, 3]])
+                self.assertEqual(target.valid_mask.tolist(), [False, False, True])
 
     def test_sampled_positions_include_last_token(self):
         target = self.backend.normalize(request(), self.rows)

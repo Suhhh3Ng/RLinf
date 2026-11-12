@@ -179,13 +179,14 @@ def build_distillation_plan(cfg: Mapping) -> DistillationPlan:
     if loss.use_policy_gradient:
         sampling = algorithm.get("sampling_params", {})
         if (
-            sampling.get("temperature", 1.0) != 1.0
+            not sampling.get("do_sample", True)
+            or sampling.get("temperature", 1.0) != 1.0
             or sampling.get("top_p", 1.0) != 1.0
             or sampling.get("top_k", -1) not in (-1, 0)
             or sampling.get("repetition_penalty", 1.0) != 1.0
         ):
             raise ValueError(
-                "Distillation PG currently requires temperature=1, top_p=1 and disabled sampling top_k; truncated behavior probabilities are not verified"
+                "Distillation PG currently requires do_sample=True, temperature=1, top_p=1 and disabled sampling top_k; truncated behavior probabilities are not verified"
             )
     if cfg.get("data", {}).get("type") in {"vlm", "vision_language"}:
         raise ValueError("Stage-one distillation supports text-only inputs")

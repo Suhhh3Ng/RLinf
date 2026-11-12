@@ -1015,7 +1015,7 @@ class FSDPActor(FSDPModelManager, Worker):
             count = (
                 mask.sum()
                 if self.cfg.algorithm.loss_agg_func == "token-mean"
-                else mask.any(-1).sum()
+                else batch.get("distillation_sequence_counts", mask.any(-1)).sum()
             )
             count = count.to(Worker.torch_device_type, dtype=torch.float64)
             torch.distributed.all_reduce(count)

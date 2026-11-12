@@ -1112,7 +1112,7 @@ class DynamicRolloutResult:
         }
         if batch_template is not None:
             for key in available_keys:
-                if key.startswith("teacher_") or key == "distillation_loss_scales":
+                if key.startswith(("teacher_", "distillation_")):
                     value = batch_template[key]
                     batch_pad[key] = value.new_zeros((1, *value.shape[1:]))
         batch_pad = {k: v for k, v in batch_pad.items() if k in available_keys}
@@ -1244,6 +1244,14 @@ class DynamicRolloutResult:
                         break
 
         num_sequence = len(batch["idx_to_traj"])
+        reduction = context.get("loss_agg_func", "token-mean")
+        if "distillation_loss_scales" in batch:
+            batch = dict(batch)
+            valid = batch["response_mask"] & batch["teacher_valid_mask"].to(
+                batch["response_mask"].device
+            )
+            # Keep the original turn denominator through packing and DP balancing.
+            batch["distillation_sequence_counts"] = valid.any(-1).long()
         new_idx_to_traj = []
         split_params: dict[str, Union[torch.Tensor, list]] = {}
         tensor_keys = [
@@ -1261,6 +1269,7 @@ class DynamicRolloutResult:
             "advantages",
             "loss_scales",
             "distillation_loss_scales",
+            "distillation_sequence_counts",
             "teacher_logprobs",
             "teacher_token_ids",
             "teacher_valid_mask",
@@ -1294,6 +1303,33 @@ class DynamicRolloutResult:
                 ]
                 split_params[key][suffix] = torch.stack(value).sum(dim=0)
 
+            if "distillation_loss_scales" in split_params:
+                masks = [
+                    split_params["response_mask"][idx]
+                    & split_params["teacher_valid_mask"][idx].to(
+                        split_params["response_mask"][idx].device
+                    )
+                    for idx in idxes
+                ]
+                counts = [mask.sum().item() for mask in masks]
+                scales = [
+                    split_params["distillation_loss_scales"][idx].masked_fill(
+                        ~masks[i], 0
+                    )
+                    * (
+                        sum(counts) / max(counts[i], 1)
+                        if reduction == "seq-mean-token-mean"
+                        else 1
+                    )
+                    for i, idx in enumerate(idxes)
+                ]
+                split_params["distillation_loss_scales"][suffix] = torch.stack(
+                    scales
+                ).sum(dim=0)
+                split_params["distillation_sequence_counts"][suffix] = torch.stack(
+                    [split_params["distillation_sequence_counts"][idx] for idx in idxes]
+                ).sum(dim=0)
+
             for key in ("teacher_logprobs", "teacher_token_ids", "teacher_valid_mask"):
                 if key not in split_params:
                     continue
@@ -1310,17 +1346,15 @@ class DynamicRolloutResult:
                 split_params["response_mask"][idx].sum().item() for idx in idxes
             ]
             masked_count_all = sum(masked_counts)
-            for scale_key in ("loss_scales", "distillation_loss_scales"):
-                if scale_key not in split_params:
-                    continue
+            if "loss_scales" in split_params:
                 value = [
-                    split_params[scale_key][idx].masked_fill(
+                    split_params["loss_scales"][idx].masked_fill(
                         ~split_params["response_mask"][idx], 0
                     )
                     * (masked_count_all / max(masked_counts[i], 1))
                     for i, idx in enumerate(idxes)
                 ]
-                split_params[scale_key][suffix] = torch.stack(value).sum(dim=0)
+                split_params["loss_scales"][suffix] = torch.stack(value).sum(dim=0)
 
             response_mask = [split_params["response_mask"][idx] for idx in idxes]
             split_params["response_mask"][suffix] = (
@@ -1356,10 +1390,6 @@ class DynamicRolloutResult:
         folding_scale = context["folding_scale"]
         if "group_level" in folding_scale:
             packed_batch["loss_scales"] *= num_sequence_after / num_sequence
-            if "distillation_loss_scales" in packed_batch:
-                packed_batch["distillation_loss_scales"] *= (
-                    num_sequence_after / num_sequence
-                )
 
         return packed_batch
 

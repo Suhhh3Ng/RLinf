@@ -631,6 +631,7 @@ class MAFSDPActor(FSDPActor):
 
         scale_context = {
             "folding_scale": [],
+            "loss_agg_func": self.cfg.algorithm.loss_agg_func,
             "enable_scale_of_group": False,
             "actor_global_batch_size": (
                 self.cfg.data.rollout_batch_size

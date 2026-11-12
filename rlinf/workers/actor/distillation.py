@@ -72,13 +72,15 @@ def fsdp_distillation_forward(
             z = logits[
                 0 if packed else row,
                 prediction_left : prediction_left + right - left,
-                :vocab,
+                :,
             ]
             destination = slice(left - offset, right - offset)
             if select_ids:
-                ids_output[row, destination] = z.detach().argsort(
-                    dim=-1, descending=True, stable=True
-                )[..., : config.topk]
+                ids_output[row, destination] = (
+                    z[..., :vocab]
+                    .detach()
+                    .argsort(dim=-1, descending=True, stable=True)[..., : config.topk]
+                )
                 continue
             mask = batch["response_mask"][row, left:right].bool().to(z.device)
             mask = mask & batch["teacher_valid_mask"][row, destination].to(z.device)
@@ -94,7 +96,7 @@ def fsdp_distillation_forward(
                 ids = batch.get("teacher_token_ids")
                 ids = None if ids is None else ids[row, destination].to(z.device)
                 output = compute_distribution_loss(
-                    z,
+                    z[..., :vocab],
                     ids,
                     batch["teacher_logprobs"][row, destination].to(z.device),
                     config,

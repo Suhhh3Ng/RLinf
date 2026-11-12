@@ -40,7 +40,7 @@ class VLLMTeacherBackend(TeacherScoringBackend):
             ),
             max_model_len=info.max_context_length,
         )
-        options.setdefault("max_logprobs", info.vocab_size)
+        options.setdefault("max_logprobs", self.model_vocab_size)
         self.engine = AsyncLLM.from_engine_args(AsyncEngineArgs(**options))
         return info
 
@@ -49,7 +49,9 @@ class VLLMTeacherBackend(TeacherScoringBackend):
         from vllm.inputs import TokensPrompt
 
         self.validate_request(request)
-        full = request.topk == -1 or request.selected_token_ids is not None
+        if request.selected_token_ids is not None:
+            return await self.score_selected(request)
+        full = request.topk == -1
         count = self.info.vocab_size if full else request.topk or 0
         output = None
         async for output in self.engine.generate(
@@ -71,6 +73,32 @@ class VLLMTeacherBackend(TeacherScoringBackend):
             for row in output.prompt_logprobs
         ]
         return self.normalize(request, rows)
+
+    async def score_next(
+        self, prefix: tuple[int, ...], selected_ids: tuple[int, ...], request_id: str
+    ) -> dict[int, float]:
+        from vllm import SamplingParams
+        from vllm.inputs import TokensPrompt
+
+        # Older supported vLLM versions have no selected-token scoring API.
+        count = self.model_vocab_size or self.info.vocab_size
+        output = None
+        async for output in self.engine.generate(
+            TokensPrompt(prompt_token_ids=list(prefix)),
+            SamplingParams(
+                temperature=1.0, max_tokens=1, logprobs=count, detokenize=False
+            ),
+            request_id,
+        ):
+            pass
+        if output is None or not output.outputs or not output.outputs[0].logprobs:
+            raise ValueError(f"Teacher request {request_id}: missing next-token scores")
+        row = output.outputs[0].logprobs[0]
+        if any(i not in row for i in selected_ids):
+            raise ValueError(
+                f"Teacher request {request_id}: missing selected-token scores"
+            )
+        return {i: float(row[i].logprob) for i in selected_ids}
 
     async def close(self) -> None:
         if self.engine is not None:

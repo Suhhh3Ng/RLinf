@@ -38,7 +38,9 @@ class SGLangTeacherBackend(TeacherScoringBackend):
 
     async def score(self, request: TeacherScoreRequest) -> TeacherTargets:
         self.validate_request(request)
-        full = request.topk == -1 or request.selected_token_ids is not None
+        if request.selected_token_ids is not None:
+            return await self.score_selected(request)
+        full = request.topk == -1
         count = self.info.vocab_size if full else request.topk or 0
         output = await self.engine.async_generate(
             input_ids=list(request.input_ids),
@@ -59,6 +61,22 @@ class SGLangTeacherBackend(TeacherScoringBackend):
                 for row in meta["input_top_logprobs"]
             ]
         return self.normalize(request, rows)
+
+    async def score_next(
+        self, prefix: tuple[int, ...], selected_ids: tuple[int, ...], request_id: str
+    ) -> dict[int, float]:
+        output = await self.engine.async_generate(
+            input_ids=list(prefix),
+            sampling_params={"temperature": 1.0, "max_new_tokens": 1},
+            return_logprob=True,
+            logprob_start_len=-1,
+            top_logprobs_num=0,
+            token_ids_logprob=list(selected_ids),
+        )
+        rows = output["meta_info"]["output_token_ids_logprobs"]
+        if not rows:
+            raise ValueError(f"Teacher request {request_id}: missing next-token scores")
+        return {int(item[1]): float(item[0]) for item in rows[0]}
 
     async def close(self) -> None:
         if self.engine is not None:

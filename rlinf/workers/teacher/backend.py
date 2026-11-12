@@ -36,10 +36,13 @@ class TeacherModelInfo:
 
 def tokenizer_fingerprint(tokenizer) -> str:
     """Hash token mappings and special/added token semantics."""
+    special = dict(tokenizer.special_tokens_map)
+    if not special.get("pad_token") and special.get("eos_token"):
+        special["pad_token"] = special["eos_token"]
     payload = {
         "vocab": tokenizer.get_vocab(),
         "added": tokenizer.get_added_vocab(),
-        "special": tokenizer.special_tokens_map,
+        "special": special,
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str).encode()
@@ -54,15 +57,19 @@ class TeacherScoringBackend(ABC):
         self.teacher_key = teacher_key
         self.engine = None
         self.info = None
+        self.model_vocab_size = None
 
     def load_model_info(self) -> TeacherModelInfo:
         """Load tokenizer identity before allocating the inference engine."""
-        from transformers import AutoConfig, AutoTokenizer
+        from transformers import AutoConfig
+
+        from rlinf.models.tokenization import hf_tokenizer
 
         path = self.config.model_path
         trust = self.config.inference.get("trust_remote_code", False)
-        tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=trust)
+        tokenizer = hf_tokenizer(path, trust_remote_code=trust)
         config = AutoConfig.from_pretrained(path, trust_remote_code=trust)
+        self.model_vocab_size = config.vocab_size
         ids = set(tokenizer.get_vocab().values())
         if ids != set(range(len(ids))):
             raise ValueError("Teacher requires a contiguous real tokenizer vocabulary")
@@ -101,10 +108,18 @@ class TeacherScoringBackend(ABC):
         estimated_bytes = (
             len(request.input_ids) * width * (4 if request.topk == -1 else 12)
         )
+        # Include engine objects and normalized dictionaries, not just tensors.
+        retained_scores = len(request.input_ids) * (width + 1)
+        transient_scores = (
+            (self.model_vocab_size or self.info.vocab_size) + 1
+            if request.selected_token_ids is not None
+            else retained_scores
+        )
+        estimated_bytes += 256 * (retained_scores + transient_scores)
         budget = self.config.inference.get("max_payload_bytes", 256 * 1024 * 1024)
         if estimated_bytes > budget:
             raise ValueError(
-                f"Teacher request {request.request_id}: estimated tensor payload {estimated_bytes} exceeds budget {budget}"
+                f"Teacher request {request.request_id}: estimated scoring payload {estimated_bytes} exceeds budget {budget}"
             )
         if (
             request.teacher_key != self.teacher_key
@@ -117,6 +132,25 @@ class TeacherScoringBackend(ABC):
             raise ValueError(
                 f"Teacher request {request.request_id}: expected context <= {self.info.max_context_length - 1}, got {len(request.input_ids)}"
             )
+
+    async def score_selected(self, request: TeacherScoreRequest) -> TeacherTargets:
+        """Score one original prefix at a time, retaining only its selected IDs."""
+        self.validate_request(request)
+        rows = [None] * len(request.input_ids)
+        for position in range(1, len(request.input_ids)):
+            if request.response_mask[position]:
+                rows[position] = await self.score_next(
+                    request.input_ids[:position],
+                    request.selected_token_ids[position],
+                    f"{request.request_id}-{position}",
+                )
+        return self.normalize(request, rows)
+
+    @abstractmethod
+    async def score_next(
+        self, prefix: tuple[int, ...], selected_ids: tuple[int, ...], request_id: str
+    ) -> dict[int, float]:
+        """Return selected next-token scores with full-vocabulary normalization."""
 
     def normalize(
         self, request: TeacherScoreRequest, rows: list[dict[int, float] | None]

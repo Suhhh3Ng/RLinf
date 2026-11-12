@@ -196,6 +196,11 @@ def down_sample_batch(rollout_result: RolloutResult, down_sampling_config: dict)
         rr.ref_logprobs = _apply_mask_to_tensor(rr.ref_logprobs, idx_mask)
     if rr.recomputed_logprobs is not None:
         rr.recomputed_logprobs = _apply_mask_to_tensor(rr.recomputed_logprobs, idx_mask)
+    if rr.teacher_targets is not None:
+        rr.teacher_targets = _apply_mask_to_list(rr.teacher_targets, idx_mask)
+    if rr.teacher_requests is not None:
+        rr.teacher_requests = _apply_mask_to_list(rr.teacher_requests, idx_mask)
+    rr.num_sequence = int(idx_mask.sum().item())
 
     _dsn = int(down_sampling_config.get("down_sample_to_n", -1))
     if _dsn > 0:

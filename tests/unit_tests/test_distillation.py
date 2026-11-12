@@ -24,6 +24,7 @@ import torch.multiprocessing as mp
 
 from rlinf.algorithms.distillation.config import (
     DistillationLossConfig,
+    DistillationPlan,
     build_distillation_plan,
 )
 from rlinf.algorithms.distillation.fsdp import compute_distribution_loss
@@ -152,6 +153,107 @@ def _tp_process(rank, path):
 
 
 class TestDistillation(unittest.TestCase):
+    def test_policy_gradient_rejects_greedy_sampling(self):
+        cfg = {
+            "distillation": {
+                "enabled": True,
+                "teacher_models": {"default": {"model_path": "teacher"}},
+            },
+            "algorithm": {
+                "sampling_params": {
+                    "do_sample": False,
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": -1,
+                }
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "do_sample=True"):
+            build_distillation_plan(cfg)
+        cfg["algorithm"]["sampling_params"]["do_sample"] = True
+        self.assertTrue(build_distillation_plan(cfg).use_policy_gradient)
+        cfg["algorithm"]["sampling_params"]["do_sample"] = False
+        cfg["distillation"]["distillation_loss"] = {"use_policy_gradient": False}
+        self.assertFalse(build_distillation_plan(cfg).use_policy_gradient)
+
+    def test_fsdp_sampled_logprobs_keep_model_vocabulary(self):
+        from rlinf.workers.actor.distillation import fsdp_distillation_forward
+        from rlinf.workers.actor.fsdp_actor_worker import FSDPActor
+
+        actor = object.__new__(FSDPActor)
+        actor.distillation_plan = DistillationPlan(need_entropy=True)
+        actor.distillation_loss_config = DistillationLossConfig(topk=2)
+        actor.tokenizer = range(5)
+        actor.response_len = 2
+        actor.entropy_op_type = "torch"
+        for packed in (False, True):
+            for response_only in (False, True):
+                with self.subTest(packed=packed, response_only=response_only):
+                    z = torch.zeros(1, 3, 8, requires_grad=True)
+                    batch = {
+                        "input_ids": torch.tensor([[1, 2, 3]]),
+                        "response_mask": torch.tensor([[False, True, True]]),
+                        "teacher_valid_mask": torch.ones(
+                            1, 2 if response_only else 3, dtype=torch.bool
+                        ),
+                    }
+                    out = fsdp_distillation_forward(
+                        actor,
+                        z,
+                        batch,
+                        packed=packed,
+                        starts=[0],
+                        ends=[3],
+                        response_only=response_only,
+                    )
+                    expected = actor.compute_logprobs(
+                        z[:, :2], batch["input_ids"][:, 1:]
+                    )
+                    actual = out.logprobs[:, -2:]
+                    torch.testing.assert_close(
+                        (actual - expected).exp(), torch.ones_like(actual)
+                    )
+                    torch.testing.assert_close(
+                        out.entropy[:, -2:],
+                        torch.full_like(actual, torch.tensor(8.0).log()),
+                    )
+                    torch.testing.assert_close(
+                        torch.autograd.grad(actual.sum(), z, retain_graph=True)[0],
+                        torch.autograd.grad(expected.sum(), z)[0],
+                    )
+
+    def test_fsdp_distribution_and_selection_exclude_padded_vocabulary(self):
+        from rlinf.workers.actor.distillation import fsdp_distillation_forward
+        from rlinf.workers.actor.fsdp_actor_worker import FSDPActor
+
+        actor = object.__new__(FSDPActor)
+        actor.distillation_plan = DistillationPlan(
+            canonical_loss_mode="forward_kl_topk", target_format="sparse"
+        )
+        actor.distillation_loss_config = DistillationLossConfig(
+            loss_mode="forward_kl_topk", topk=2, use_policy_gradient=False
+        )
+        actor.tokenizer = range(5)
+        actor.response_len = 1
+        actor.entropy_op_type = "torch"
+        z = torch.zeros(1, 2, 8)
+        z[..., 5:] = 10
+        batch = {
+            "input_ids": torch.tensor([[1, 2]]),
+            "response_mask": torch.tensor([[False, True]]),
+            "teacher_valid_mask": torch.tensor([[True]]),
+            "teacher_token_ids": torch.tensor([[[0, 1]]]),
+            "teacher_logprobs": torch.full((1, 1, 2), -torch.tensor(5.0).log()),
+        }
+        kwargs = {"packed": False, "starts": [0], "ends": [2], "response_only": True}
+        out = fsdp_distillation_forward(actor, z, batch, **kwargs)
+        torch.testing.assert_close(out.distribution_losses, torch.zeros(1, 1))
+        torch.testing.assert_close(
+            out.logprobs, actor.compute_logprobs(z[:, :1], batch["input_ids"][:, 1:])
+        )
+        ids = fsdp_distillation_forward(actor, z, batch, select_ids=True, **kwargs)
+        self.assertEqual(ids.tolist(), [[[0, 1]]])
+
     def test_config_aliases_and_invalid_combinations(self):
         for alias, canonical in [("kl", "k1"), ("mse", "k2"), ("low_var_kl", "k3")]:
             self.assertEqual(

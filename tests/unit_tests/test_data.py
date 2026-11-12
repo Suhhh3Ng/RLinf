@@ -3753,3 +3753,125 @@ def test_teacher_targets_packing_copies_disjoint_spans():
         torch.tensor([[[0.0], [-1.0], [-2.0], [-3.0], [-4.0]]]),
     )
     assert packed["teacher_valid_mask"].tolist() == [[False, True, True, True, True]]
+
+
+@pytest.mark.parametrize(
+    "mode", ["token-mean", "seq-mean-token-mean", "seq-mean-token-sum"]
+)
+@pytest.mark.parametrize("folding", [[], ["group_level"]])
+@pytest.mark.parametrize("empty_turn", [False, True])
+def test_packed_distillation_preserves_loss_and_gradients(mode, folding, empty_turn):
+    from rlinf.algorithms.distillation.losses import DistillationReductionContext
+    from rlinf.data.schema.reasoning_results import DynamicRolloutResult
+
+    mask = torch.tensor(
+        [
+            [False, True, False, False, False],
+            [False, False, False, True, True],
+            [False, True, True, False, False],
+        ]
+    )
+    valid = mask.clone()
+    if empty_turn:
+        valid[0] = False
+    batch = {
+        "idx_to_traj": [0, 0, 1],
+        "input_ids": torch.tensor([[1, 2, 0, 0, 0], [1, 2, 3, 4, 5], [3, 4, 2, 0, 0]]),
+        "prompt_lengths": torch.tensor([1, 3, 1]),
+        "response_lengths": torch.tensor([1, 2, 2]),
+        "response_mask": mask,
+        "teacher_valid_mask": valid,
+        "loss_scales": torch.ones(3, 5),
+        "distillation_loss_scales": torch.tensor([[1.0] * 5, [0.5] * 5, [2.0] * 5]),
+    }
+    packed = DynamicRolloutResult.pack_traj_batch(
+        {"folding_scale": folding, "loss_agg_func": mode}, batch
+    )
+    assert packed["input_ids"].shape[0] == 2
+    assert packed["distillation_sequence_counts"].sum() == valid.any(-1).sum()
+    values = torch.arange(1.0, 6.0, requires_grad=True)
+
+    def loss(b):
+        active = b["response_mask"] & b["teacher_valid_mask"]
+        denominator = (
+            active.sum()
+            if mode == "token-mean"
+            else b.get("distillation_sequence_counts", active.any(-1)).sum()
+        )
+        return DistillationReductionContext(denominator.item(), mode).reduce(
+            values.unsqueeze(0) * b["distillation_loss_scales"], active
+        )
+
+    before, after = loss(batch), loss(packed)
+    torch.testing.assert_close(after, before)
+    torch.testing.assert_close(
+        torch.autograd.grad(after, values)[0], torch.autograd.grad(before, values)[0]
+    )
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_downsampling_preserves_teacher_alignment(pending):
+    from rlinf.data.schema.distillation import (
+        TeacherScoreRequest,
+        TeacherTargets,
+        teacher_targets_to_batch,
+    )
+    from rlinf.data.schema.reasoning_results import RolloutResult
+    from rlinf.utils.down_sampling import down_sample_batch
+
+    targets = [
+        TeacherTargets(
+            str(i),
+            "default",
+            "model",
+            "sampled",
+            None,
+            torch.tensor([[0], [2]]),
+            torch.tensor([[0.0], [-float(i + 1)]]),
+            torch.tensor([False, True]),
+        )
+        for i in range(4)
+    ]
+    requests = [
+        TeacherScoreRequest(
+            str(i),
+            str(i),
+            "group",
+            "default",
+            (1, 2),
+            (False, True),
+            1,
+            "tok",
+            student_policy_version="0",
+        )
+        for i in range(4)
+    ]
+    rr = RolloutResult(
+        num_sequence=4,
+        group_size=2,
+        prompt_lengths=[1] * 4,
+        prompt_ids=[[1]] * 4,
+        response_lengths=[1] * 4,
+        response_ids=[[2]] * 4,
+        is_end=[True] * 4,
+        rewards=[0.0, 0.0, 0.0, 1.0],
+        response_texts=["answer"] * 4,
+        teacher_targets=None if pending else targets,
+        teacher_requests=requests if pending else None,
+    )
+    result = down_sample_batch(rr, {"reject_equal_reward": True})
+    assert result.num_sequence == len(result.prompt_ids) == 2
+    if pending:
+        assert [r.request_id for r in result.teacher_requests] == ["2", "3"]
+    else:
+        assert [t.request_id for t in result.teacher_targets] == ["2", "3"]
+        batch = teacher_targets_to_batch(
+            result.teacher_targets,
+            result.prompt_lengths,
+            result.response_lengths,
+            1,
+            response_only=True,
+        )
+        torch.testing.assert_close(
+            batch["teacher_logprobs"], torch.tensor([[[-3.0]], [[-4.0]]])
+        )
