@@ -49,8 +49,10 @@ class VLLMTeacherBackend(TeacherScoringBackend):
         from vllm.inputs import TokensPrompt
 
         self.validate_request(request)
-        if request.selected_token_ids is not None:
-            return await self.score_selected(request)
+        if request.selected_token_ids is not None or (
+            request.topk is not None and self.has_extra_model_tokens
+        ):
+            return await self.score_response_tokens(request)
         full = request.topk == -1
         count = self.info.vocab_size if full else request.topk or 0
         output = None

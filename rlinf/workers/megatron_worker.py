@@ -803,7 +803,7 @@ class MegatronWorker(MegatronModelManager, Worker):
 
         # Valid token scale
         if (
-            not self.distillation_plan.enabled
+            self.distillation_plan.need_task_advantages
             and self.cfg.algorithm.use_valid_token_scale
         ):
             self._setup_valid_token_scale(batch)

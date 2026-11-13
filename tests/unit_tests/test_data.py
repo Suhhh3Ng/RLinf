@@ -3859,6 +3859,34 @@ def test_downsampling_preserves_teacher_alignment(pending):
         teacher_targets=None if pending else targets,
         teacher_requests=requests if pending else None,
     )
+    from rlinf.scheduler import Worker
+
+    groups = [
+        down_sample_batch(group, {"reject_equal_reward": True})
+        for group in RolloutResult.split_results(copy.deepcopy(rr), 2)
+    ]
+    assert sum(group.num_sequence for group in groups) == 4
+    with (
+        patch.object(Worker, "torch_device_type", "cpu"),
+        patch.object(torch.Tensor, "cuda", lambda tensor: tensor),
+    ):
+        empty, retained = [group.to_actor_batch(1, 2, 0) for group in groups]
+    for batches in ([empty, retained, retained], [retained, empty, retained]):
+        merged = RolloutResult.merge_batches(batches)
+        assert merged["input_ids"].shape == (4, 2)
+        if pending:
+            assert [r.request_id for r in merged["teacher_requests"]] == [
+                "2",
+                "3",
+                "2",
+                "3",
+            ]
+        else:
+            torch.testing.assert_close(
+                merged["teacher_logprobs"],
+                torch.tensor([[[-3.0]], [[-4.0]], [[-3.0]], [[-4.0]]]),
+            )
+            assert merged["teacher_valid_mask"].all()
     result = down_sample_batch(rr, {"reject_equal_reward": True})
     assert result.num_sequence == 4
     assert len(result.prompt_ids) == 2

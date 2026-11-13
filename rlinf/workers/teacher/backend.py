@@ -99,6 +99,11 @@ class TeacherScoringBackend(ABC):
         )
         return self.info
 
+    @property
+    def has_extra_model_tokens(self) -> bool:
+        """Whether distribution scores need tokenizer-vocabulary normalization."""
+        return (self.model_vocab_size or self.info.vocab_size) > self.info.vocab_size
+
     def validate_request(self, request: TeacherScoreRequest) -> None:
         """Check identity and context capacity without exposing prompt contents."""
         if self.info is None:
@@ -113,6 +118,7 @@ class TeacherScoringBackend(ABC):
         transient_scores = (
             (self.model_vocab_size or self.info.vocab_size) + 1
             if request.selected_token_ids is not None
+            or (request.topk is not None and self.has_extra_model_tokens)
             else retained_scores
         )
         estimated_bytes += 256 * (retained_scores + transient_scores)
@@ -133,17 +139,36 @@ class TeacherScoringBackend(ABC):
                 f"Teacher request {request.request_id}: expected context <= {self.info.max_context_length - 1}, got {len(request.input_ids)}"
             )
 
-    async def score_selected(self, request: TeacherScoreRequest) -> TeacherTargets:
-        """Score one original prefix at a time, retaining only its selected IDs."""
+    async def score_response_tokens(
+        self, request: TeacherScoreRequest
+    ) -> TeacherTargets:
+        """Score original prefixes, retaining only the requested distribution support."""
         self.validate_request(request)
         rows = [None] * len(request.input_ids)
+        vocabulary = tuple(range(self.info.vocab_size))
         for position in range(1, len(request.input_ids)):
-            if request.response_mask[position]:
-                rows[position] = await self.score_next(
-                    request.input_ids[:position],
-                    request.selected_token_ids[position],
-                    f"{request.request_id}-{position}",
+            if not request.response_mask[position]:
+                continue
+            selected = (
+                request.selected_token_ids[position]
+                if request.selected_token_ids is not None
+                else vocabulary
+            )
+            row = await self.score_next(
+                request.input_ids[:position],
+                vocabulary if self.has_extra_model_tokens else selected,
+                f"{request.request_id}-{position}",
+            )
+            if self.has_extra_model_tokens:
+                # Normalize over every tokenizer ID before selecting sparse support.
+                logprobs = torch.tensor(
+                    [row[i] for i in vocabulary], dtype=torch.float64
                 )
+                normalizer = logprobs.logsumexp(0).item()
+                row = {i: row[i] - normalizer for i in vocabulary}
+            if request.selected_token_ids is None and request.topk != -1:
+                selected = sorted(row, key=lambda i: (-row[i], i))[: request.topk]
+            rows[position] = {i: row[i] for i in selected}
         return self.normalize(request, rows)
 
     @abstractmethod

@@ -176,13 +176,133 @@ class TestDistillation(unittest.TestCase):
         cfg["distillation"]["distillation_loss"] = {"use_policy_gradient": False}
         self.assertFalse(build_distillation_plan(cfg).use_policy_gradient)
 
+    def test_policy_gradient_validates_effective_sglang_sampling(self):
+        import copy
+
+        sampling = {"do_sample": True, "temperature": 1.0, "top_p": 1.0, "top_k": -1}
+        cfg = {
+            "distillation": {
+                "enabled": True,
+                "teacher_models": {"default": {"model_path": "teacher"}},
+            },
+            "algorithm": {"sampling_params": sampling},
+            "rollout": {"rollout_backend": "sglang"},
+        }
+        for override in (
+            {"do_sample": False},
+            {"temperature": 0.7},
+            {"top_p": 0.9},
+            {"top_k": 10},
+            {"repetition_penalty": 1.1},
+        ):
+            with self.subTest(override=override):
+                cfg["rollout"]["sampling_params"] = {**sampling, **override}
+                before = copy.deepcopy(cfg)
+                with self.assertRaisesRegex(ValueError, "Distillation PG"):
+                    build_distillation_plan(cfg)
+                self.assertEqual(cfg, before)
+                cfg["rollout"]["rollout_backend"] = "vllm"
+                self.assertTrue(build_distillation_plan(cfg).use_policy_gradient)
+                cfg["rollout"]["rollout_backend"] = "sglang"
+        cfg["rollout"]["sampling_params"] = None
+        self.assertTrue(build_distillation_plan(cfg).use_policy_gradient)
+        cfg["algorithm"]["sampling_params"] = {**sampling, "do_sample": False}
+        with self.assertRaises(ValueError):
+            build_distillation_plan(cfg)
+        cfg["rollout"]["sampling_params"] = sampling
+        self.assertTrue(build_distillation_plan(cfg).use_policy_gradient)
+
+    def test_megatron_joint_loss_preserves_token_weighting(self):
+        import sys
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from omegaconf import OmegaConf
+
+        # Only the external Megatron topology API is needed for this CPU test.
+        topology = SimpleNamespace(get_data_parallel_world_size=lambda: 1)
+        with patch.dict(
+            sys.modules, {"megatron.core": SimpleNamespace(parallel_state=topology)}
+        ):
+            from rlinf.workers.actor.megatron_distillation import (
+                combine_actor_distillation,
+            )
+
+        actor = SimpleNamespace(
+            response_len=3,
+            distillation_plan=DistillationPlan(
+                enabled=True,
+                canonical_loss_mode="forward_kl_topk",
+                target_format="sparse",
+                need_task_rewards=True,
+            ),
+            distillation_loss_config=DistillationLossConfig(
+                loss_mode="forward_kl_topk",
+                use_policy_gradient=False,
+                use_task_rewards=True,
+                distillation_loss_coef=0.7,
+            ),
+            cfg=OmegaConf.create(
+                {
+                    "algorithm": {
+                        "loss_agg_func": "token-mean",
+                        "use_valid_token_scale": True,
+                    }
+                }
+            ),
+            global_valid_token=4,
+            num_microbatches=2,
+            _distillation_denominator=3,
+        )
+        current = torch.zeros(2, 3, requires_grad=True)
+        distributions = torch.tensor(
+            [[2.0, 0.0, 0.0], [2.0, 4.0, 6.0]], requires_grad=True
+        )
+        masks = torch.tensor([[True, False, False], [True, True, True]])
+        teacher_masks = torch.tensor([[True, False, False], [False, True, True]])
+        advantages = torch.tensor([[1.0, 0.0, 0.0], [3.0, 3.0, 3.0]])
+        combined = []
+        for i in range(2):
+            task_loss, _ = compute_ppo_actor_loss(
+                current[i : i + 1],
+                torch.zeros(1, 3),
+                0.2,
+                0.2,
+                advantages[i : i + 1],
+                loss_mask=masks[i : i + 1],
+            )
+            output = {
+                "distribution_losses": torch.nn.functional.pad(
+                    distributions[i : i + 1], (0, 1)
+                )
+            }
+            batch = {
+                "response_mask": torch.nn.functional.pad(masks[i : i + 1], (1, 0)),
+                "teacher_valid_mask": teacher_masks[i : i + 1],
+                "teacher_logprobs": torch.zeros(1, 3, 1),
+            }
+            loss, _ = combine_actor_distillation(
+                actor, output, batch, task_loss, dynamic=False
+            )
+            combined.append(loss)
+        actual = torch.stack(combined).mean()
+        expected = -(current.exp() * advantages)[masks].sum() / 4
+        expected = expected + 0.7 * distributions[teacher_masks].sum() / 3
+        torch.testing.assert_close(actual, expected)
+        actual_grad = torch.autograd.grad(
+            actual, (current, distributions), retain_graph=True
+        )
+        expected_grad = torch.autograd.grad(expected, (current, distributions))
+        for actual_value, expected_value in zip(actual_grad, expected_grad):
+            torch.testing.assert_close(actual_value, expected_value)
+
     def test_fsdp_sampled_logprobs_keep_model_vocabulary(self):
         from rlinf.workers.actor.distillation import fsdp_distillation_forward
         from rlinf.workers.actor.fsdp_actor_worker import FSDPActor
 
         actor = object.__new__(FSDPActor)
         actor.distillation_plan = DistillationPlan(need_entropy=True)
-        actor.distillation_loss_config = DistillationLossConfig(topk=2)
+        actor.distillation_loss_config = DistillationLossConfig()
         actor.tokenizer = range(5)
         actor.response_len = 2
         actor.entropy_op_type = "torch"

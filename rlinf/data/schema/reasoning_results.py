@@ -744,6 +744,9 @@ class RolloutResult:
         merged_batch = {}
         if len(batches) == 0:
             return merged_batch
+        nonempty_batches = [batch for batch in batches if batch["input_ids"].numel()]
+        if nonempty_batches:
+            batches = nonempty_batches
         if len(batches) == 1:
             return batches[0]
         assert all(batch.keys() == batches[0].keys() for batch in batches[1:]), (

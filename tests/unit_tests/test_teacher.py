@@ -177,6 +177,96 @@ class TestTeacher(unittest.TestCase):
                 self.assertEqual(calls, [[1, 3]])
                 self.assertEqual(target.valid_mask.tolist(), [False, False, True])
 
+    def test_distribution_scores_normalize_before_selecting_support(self):
+        from rlinf.algorithms.distillation.config import DistillationLossConfig
+        from rlinf.algorithms.distillation.fsdp import compute_distribution_loss
+
+        logits = torch.tensor(
+            [
+                [0.0, 1.0, 2.0, 3.0, 4.0, 10.0, 11.0, 12.0],
+                [4.0, 3.0, 2.0, 1.0, 0.0, 12.0, 11.0, 10.0],
+            ]
+        )
+        model_logprobs = logits.log_softmax(-1)
+        expected = logits[:, :5].log_softmax(-1)
+
+        class VLLMEngine:
+            async def generate(self, prompt, params, request_id):
+                self_test.assertEqual(params.logprobs, 8)
+                row = model_logprobs[len(prompt["prompt_token_ids"]) - 1]
+                yield SimpleNamespace(
+                    outputs=[
+                        SimpleNamespace(
+                            logprobs=[
+                                {
+                                    i: SimpleNamespace(logprob=float(value))
+                                    for i, value in enumerate(row)
+                                }
+                            ]
+                        )
+                    ]
+                )
+
+        class SGLangEngine:
+            async def async_generate(self, **kwargs):
+                self_test.assertEqual(kwargs["token_ids_logprob"], list(range(5)))
+                row = model_logprobs[len(kwargs["input_ids"]) - 1]
+                return {
+                    "meta_info": {
+                        "output_token_ids_logprobs": [
+                            [
+                                (float(row[i]), i, None)
+                                for i in kwargs["token_ids_logprob"]
+                            ]
+                        ]
+                    }
+                }
+
+        self_test = self
+        modules = {
+            "vllm": SimpleNamespace(SamplingParams=SimpleNamespace),
+            "vllm.inputs": SimpleNamespace(TokensPrompt=dict),
+        }
+        for backend_cls, engine in (
+            (VLLMTeacherBackend, VLLMEngine()),
+            (SGLangTeacherBackend, SGLangEngine()),
+        ):
+            backend = backend_cls(TeacherModelConfig("unused"), "default")
+            backend.info = self.backend.info
+            backend.model_vocab_size = 8
+            backend.engine = engine
+            for req in (request(-1), request(2), request(2, ((0, 0), (0, 2), (3, 4)))):
+                with (
+                    self.subTest(backend=backend_cls.__name__, request=req),
+                    patch.dict(sys.modules, modules),
+                ):
+                    target = asyncio.run(backend.score(req))
+                    ids = target.token_ids[1:] if target.token_ids is not None else None
+                    reference = expected if ids is None else expected.gather(-1, ids)
+                    torch.testing.assert_close(target.logprobs[1:], reference)
+                    for mode in ("forward_kl_topk_tail", "reverse_kl_topk_tail"):
+                        loss = compute_distribution_loss(
+                            logits[:, :5],
+                            ids,
+                            target.logprobs[1:],
+                            DistillationLossConfig(
+                                loss_mode=mode,
+                                topk=req.topk,
+                                topk_source="student",
+                                use_policy_gradient=False,
+                            ),
+                        )
+                        torch.testing.assert_close(
+                            loss.distribution_losses, torch.zeros(2), atol=2e-6, rtol=0
+                        )
+            rows = [None] + [
+                {i: float(v) for i, v in enumerate(row)} for row in model_logprobs
+            ]
+            sampled = backend.normalize(request(), rows)
+            torch.testing.assert_close(
+                sampled.logprobs[1:, 0], model_logprobs[[0, 1], [3, 2]]
+            )
+
     def test_sampled_positions_include_last_token(self):
         target = self.backend.normalize(request(), self.rows)
         torch.testing.assert_close(

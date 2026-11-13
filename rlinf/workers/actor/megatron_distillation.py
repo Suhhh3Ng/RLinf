@@ -157,6 +157,18 @@ def combine_actor_distillation(actor, output, batch, task_loss, *, dynamic: bool
             gradient_divisor=actor.num_microbatches,
         ),
     )
+    if (
+        not dynamic
+        and actor.distillation_plan.need_task_rewards
+        and actor.cfg.algorithm.use_valid_token_scale
+    ):
+        task_scale = (
+            mask.sum()
+            / actor.global_valid_token
+            * parallel_state.get_data_parallel_world_size()
+            * actor.num_microbatches
+        )
+        task_loss = task_loss * task_scale.item()
     return combine_distillation_and_task_loss(
         task_loss,
         loss,

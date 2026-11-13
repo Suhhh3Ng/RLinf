@@ -44,7 +44,9 @@ def fsdp_distillation_forward(
     offset = full_length - width
     shape = (len(starts), width)
     vocab = len(actor.tokenizer)
-    if config.topk > vocab:
+    if (
+        select_ids or plan.canonical_loss_mode in DISTRIBUTION_MODES
+    ) and config.topk > vocab:
         raise ValueError(f"Expected topk <= vocabulary size {vocab}, got {config.topk}")
     if select_ids:
         ids_output = torch.zeros(

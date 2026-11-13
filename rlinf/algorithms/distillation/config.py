@@ -177,7 +177,14 @@ def build_distillation_plan(cfg: Mapping) -> DistillationPlan:
             "Synchronous distillation requires fixed placement, not the migration scheduler"
         )
     if loss.use_policy_gradient:
-        sampling = algorithm.get("sampling_params", {})
+        rollout = cfg.get("rollout", {})
+        sampling = (
+            rollout.get("sampling_params")
+            if rollout.get("rollout_backend", "sglang") == "sglang"
+            else None
+        )
+        if sampling is None:
+            sampling = algorithm.get("sampling_params", {})
         if (
             not sampling.get("do_sample", True)
             or sampling.get("temperature", 1.0) != 1.0
