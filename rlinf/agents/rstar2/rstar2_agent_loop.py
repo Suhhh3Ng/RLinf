@@ -206,6 +206,10 @@ class Rstar2AgentLoopWorker(AgentLoopWorker):
             turn_prompt_ids, sampling_params={"max_new_tokens": max_resp_len}
         )
         response_ids = generate_result["output_ids"]
+        if "topk_token_ids" in generate_result:
+            generate_context.setdefault("response_topk_token_ids", []).extend(
+                generate_result["topk_token_ids"][:max_resp_len]
+            )
         if self.return_logprobs:
             generate_logprobs = generate_result["logprobs"]
         if len(response_ids) > max_resp_len:

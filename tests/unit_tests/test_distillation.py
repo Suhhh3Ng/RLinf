@@ -152,6 +152,75 @@ def _tp_process(rank, path):
         dist.destroy_process_group()
 
 
+def _empty_rank_process(rank, path):
+    from unittest.mock import patch
+
+    from rlinf.data.schema.distillation import TeacherScoreRequest
+    from rlinf.data.schema.reasoning_results import RolloutResult
+    from rlinf.scheduler import Worker
+    from rlinf.utils.down_sampling import down_sample_batch
+    from rlinf.workers.actor.fsdp_actor_worker import FSDPActor
+
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{path}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        actor = object.__new__(FSDPActor)
+        for selection in (False, True):
+            actor.distillation_plan = DistillationPlan(
+                enabled=True, need_rollout_topk=selection
+            )
+            for empty_ranks in ((0,), (1,), (0, 1)):
+                result = RolloutResult(
+                    num_sequence=2,
+                    group_size=2,
+                    prompt_lengths=[1, 1],
+                    prompt_ids=[[1], [1]],
+                    response_lengths=[1, 1],
+                    response_ids=[[2], [2]],
+                    is_end=[True, True],
+                    rewards=[0.0, 0.0] if rank in empty_ranks else [0.0, 1.0],
+                    response_texts=["answer", "answer"],
+                    teacher_requests=[
+                        TeacherScoreRequest(
+                            str(i),
+                            str(i),
+                            "g",
+                            "default",
+                            (1, 2),
+                            (False, True),
+                            1,
+                            "tok",
+                            student_policy_version="0",
+                        )
+                        for i in range(2)
+                    ],
+                )
+                result = down_sample_batch(result, {"reject_equal_reward": True})
+                assert result.num_sequence == 2
+                with (
+                    patch.object(Worker, "torch_device_type", "cpu"),
+                    patch.object(torch.Tensor, "cuda", lambda tensor: tensor),
+                ):
+                    batch = RolloutResult.merge_batches(
+                        [result.to_actor_batch(1, 2, 0)]
+                    )
+                    assert actor.prepare_distillation_targets(batch) is None
+                # No rank may have started selection or consumed the Teacher schema.
+                assert "teacher_requests" in batch
+        actor.distillation_plan = DistillationPlan(enabled=True, need_rollout_topk=True)
+        with patch.object(Worker, "torch_device_type", "cpu"):
+            batch = {"input_ids": torch.ones(2, 2, dtype=torch.long)}
+            assert actor.prepare_distillation_targets(batch) is batch
+    finally:
+        dist.destroy_process_group()
+
+
 class TestDistillation(unittest.TestCase):
     def test_policy_gradient_rejects_greedy_sampling(self):
         cfg = {
@@ -261,6 +330,8 @@ class TestDistillation(unittest.TestCase):
         masks = torch.tensor([[True, False, False], [True, True, True]])
         teacher_masks = torch.tensor([[True, False, False], [False, True, True]])
         advantages = torch.tensor([[1.0, 0.0, 0.0], [3.0, 3.0, 3.0]])
+        entropy = torch.tensor([[1.0, 0.0, 0.0], [3.0, 3.0, 3.0]], requires_grad=True)
+        ref_kl = torch.tensor([[4.0, 0.0, 0.0], [2.0, 2.0, 2.0]], requires_grad=True)
         combined = []
         for i in range(2):
             task_loss, _ = compute_ppo_actor_loss(
@@ -282,17 +353,26 @@ class TestDistillation(unittest.TestCase):
                 "teacher_logprobs": torch.zeros(1, 3, 1),
             }
             loss, _ = combine_actor_distillation(
-                actor, output, batch, task_loss, dynamic=False
+                actor,
+                output,
+                batch,
+                task_loss,
+                dynamic=False,
+                regularization_loss=-0.2 * entropy[i : i + 1][masks[i : i + 1]].mean()
+                + 0.3 * ref_kl[i : i + 1][masks[i : i + 1]].mean(),
             )
             combined.append(loss)
         actual = torch.stack(combined).mean()
         expected = -(current.exp() * advantages)[masks].sum() / 4
         expected = expected + 0.7 * distributions[teacher_masks].sum() / 3
+        expected = expected - 0.2 * entropy[masks].mean() + 0.3 * ref_kl[masks].mean()
         torch.testing.assert_close(actual, expected)
         actual_grad = torch.autograd.grad(
-            actual, (current, distributions), retain_graph=True
+            actual, (current, distributions, entropy, ref_kl), retain_graph=True
         )
-        expected_grad = torch.autograd.grad(expected, (current, distributions))
+        expected_grad = torch.autograd.grad(
+            expected, (current, distributions, entropy, ref_kl)
+        )
         for actual_value, expected_value in zip(actual_grad, expected_grad):
             torch.testing.assert_close(actual_value, expected_value)
 
@@ -371,8 +451,6 @@ class TestDistillation(unittest.TestCase):
         torch.testing.assert_close(
             out.logprobs, actor.compute_logprobs(z[:, :1], batch["input_ids"][:, 1:])
         )
-        ids = fsdp_distillation_forward(actor, z, batch, select_ids=True, **kwargs)
-        self.assertEqual(ids.tolist(), [[[0, 1]]])
 
     def test_config_aliases_and_invalid_combinations(self):
         for alias, canonical in [("kl", "k1"), ("mse", "k2"), ("low_var_kl", "k3")]:
@@ -417,7 +495,7 @@ class TestDistillation(unittest.TestCase):
             or plan.need_task_advantages
             or plan.need_current_logprobs
         )
-        self.assertTrue(plan.need_student_topk_selection)
+        self.assertTrue(plan.need_rollout_topk)
         self.assertEqual(cfg, before)
 
     def test_sampled_estimators_and_gradients(self):
@@ -650,6 +728,12 @@ class TestDistillation(unittest.TestCase):
     def test_two_rank_vocab_parallel_values_and_gradients(self):
         with tempfile.TemporaryDirectory() as directory:
             mp.spawn(_tp_process, args=(directory + "/init",), nprocs=2, join=True)
+
+    def test_two_rank_filtered_batches_skip_before_target_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mp.spawn(
+                _empty_rank_process, args=(directory + "/init",), nprocs=2, join=True
+            )
 
 
 if __name__ == "__main__":

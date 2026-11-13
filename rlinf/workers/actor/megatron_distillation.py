@@ -25,7 +25,6 @@ from rlinf.algorithms.distillation.losses import (
 )
 from rlinf.algorithms.distillation.megatron import (
     compute_vocab_parallel_distribution_loss,
-    select_vocab_parallel_topk,
 )
 
 
@@ -91,18 +90,16 @@ def distribution_processor(
     }
 
 
-def select_student_ids(actor, logits):
-    """Select fixed Student support using the Actor's tensor-parallel group."""
-    return select_vocab_parallel_topk(
-        logits,
-        actor.distillation_loss_config.topk,
-        len(actor.tokenizer),
-        parallel_state.get_tensor_model_parallel_group(),
-    )
-
-
-def combine_actor_distillation(actor, output, batch, task_loss, *, dynamic: bool):
-    """Restore target positions and add the independently normalized objective."""
+def combine_actor_distillation(
+    actor,
+    output,
+    batch,
+    task_loss,
+    *,
+    dynamic: bool,
+    regularization_loss: torch.Tensor | None = None,
+):
+    """Normalize task loss and regularizers together, then add distillation."""
     fields = {}
     for source, dest in (
         ("log_probs", "logprobs"),
@@ -157,6 +154,8 @@ def combine_actor_distillation(actor, output, batch, task_loss, *, dynamic: bool
             gradient_divisor=actor.num_microbatches,
         ),
     )
+    if actor.distillation_plan.need_task_rewards and regularization_loss is not None:
+        task_loss = task_loss + regularization_loss
     if (
         not dynamic
         and actor.distillation_plan.need_task_rewards
@@ -169,9 +168,15 @@ def combine_actor_distillation(actor, output, batch, task_loss, *, dynamic: bool
             * actor.num_microbatches
         )
         task_loss = task_loss * task_scale.item()
-    return combine_distillation_and_task_loss(
+    combined = combine_distillation_and_task_loss(
         task_loss,
         loss,
         use_task_rewards=actor.distillation_plan.need_task_rewards,
         coefficient=actor.distillation_loss_config.distillation_loss_coef,
-    ), metrics
+    )
+    if (
+        not actor.distillation_plan.need_task_rewards
+        and regularization_loss is not None
+    ):
+        combined = combined + regularization_loss
+    return combined, metrics

@@ -633,6 +633,17 @@ class RolloutResult:
                 batch["rewards"] = torch.zeros(0, dtype=torch.float32).cuda()
             if self.rollout_logprobs is not None:
                 batch["rollout_logprobs"] = torch.zeros(0, dtype=torch.float32).cuda()
+            if self.teacher_requests is not None:
+                batch["teacher_requests"] = self.teacher_requests
+            if self.teacher_targets is not None:
+                # Empty ranks are coordinated before any target tensors are consumed.
+                batch["teacher_logprobs"] = torch.zeros((0, max_response_len, 0))
+                batch["teacher_token_ids"] = torch.zeros(
+                    (0, max_response_len, 0), dtype=torch.long
+                )
+                batch["teacher_valid_mask"] = torch.zeros(
+                    (0, max_response_len), dtype=torch.bool
+                )
             return batch
 
         prompt_lengths = torch.tensor(self.prompt_lengths)

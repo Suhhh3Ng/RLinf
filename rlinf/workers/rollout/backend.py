@@ -88,6 +88,7 @@ class RolloutBackend(ABC):
         sampling_params: list[dict] | dict,
         image_data: Optional[list],
         return_logprob: list[bool] | bool,
+        top_logprobs_num: int = 0,
     ) -> dict:
         """Generate for a batch of prompts, given as text or as token ids."""
 

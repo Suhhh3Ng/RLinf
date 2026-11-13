@@ -3871,6 +3871,14 @@ def test_downsampling_preserves_teacher_alignment(pending):
         patch.object(torch.Tensor, "cuda", lambda tensor: tensor),
     ):
         empty, retained = [group.to_actor_batch(1, 2, 0) for group in groups]
+    for batches in ([empty], [empty, empty]):
+        merged_empty = RolloutResult.merge_batches(batches)
+        assert merged_empty["input_ids"].numel() == 0
+        if pending:
+            assert merged_empty["teacher_requests"] == []
+        else:
+            assert merged_empty["teacher_logprobs"].shape == (0, 1, 0)
+            assert merged_empty["teacher_valid_mask"].shape == (0, 1)
     for batches in ([empty, retained, retained], [retained, empty, retained]):
         merged = RolloutResult.merge_batches(batches)
         assert merged["input_ids"].shape == (4, 2)

@@ -40,7 +40,6 @@ from rlinf.utils.utils import retrieve_model_state_dict_in_cpu
 from rlinf.workers.actor.megatron_distillation import (
     combine_actor_distillation,
     distribution_processor,
-    select_student_ids,
     teacher_processor_args,
 )
 from rlinf.workers.megatron_worker import MegatronWorker
@@ -78,7 +77,6 @@ class MegatronActor(MegatronWorker):
             if self.distillation_plan.enabled
             else None
         )
-        self._select_distillation_ids = False
 
         # The sharding coordinates dst_tp_rank / dst_ep_rank are derived in
         # _setup_rollout_weight_dst_ranks, not here: they follow the target
@@ -162,84 +160,12 @@ class MegatronActor(MegatronWorker):
         self._teacher_endpoints = endpoints
         self._student_policy_version = student_policy_version
 
-    def prepare_distillation_targets(self, batch):
-        """Select support with rollout weights before any optimizer step."""
-        if not self.distillation_plan.need_student_topk_selection:
-            return batch
-        import asyncio
-        from dataclasses import replace
-        from uuid import uuid4
+    def prepare_distillation_targets(self, batch: dict) -> dict | None:
+        """Coordinate ready rollout targets, skipping all ranks if any is empty."""
+        from rlinf.workers.actor.distillation import has_empty_distillation_rank
 
-        from rlinf.data.schema.distillation import teacher_targets_to_batch
-        from rlinf.workers.teacher.client import TeacherClient
-
-        requests = batch.pop("teacher_requests")
-        if any(
-            request.student_policy_version != self._student_policy_version
-            for request in requests
-        ):
-            raise ValueError(
-                "Student top-k request version differs from the Actor rollout version"
-            )
-        self._load_weight_and_optimizer()
-        self._select_distillation_ids = True
-        try:
-            selected = self.inference_step(batch).cpu()
-        finally:
-            self._select_distillation_ids = False
-        dynamic = bool(getattr(self, "is_dynamic_rollout_batch", False))
-        prepared = []
-        for index, request in enumerate(requests):
-            prompt = int(batch["prompt_lengths"][index])
-            response = int(batch["response_lengths"][index])
-            ids = (
-                selected[index, : prompt + response]
-                if dynamic
-                else torch.cat(
-                    (
-                        torch.zeros((prompt, selected.shape[-1]), dtype=torch.long),
-                        selected[index, :response],
-                    )
-                )
-            )
-            prepared.append(
-                replace(
-                    request,
-                    request_id=uuid4().hex,
-                    selected_token_ids=tuple(tuple(row) for row in ids.tolist()),
-                )
-            )
-
-        async def score_all():
-            client = TeacherClient(self._teacher_endpoints)
-            try:
-                return await asyncio.gather(
-                    *(client.score(request) for request in prepared)
-                )
-            finally:
-                await client.close()
-
-        targets, scoring_error = None, None
-        try:
-            targets = asyncio.run(score_all())
-        except Exception as error:
-            scoring_error = f"{type(error).__name__}: {error}"
-        errors = [None] * torch.distributed.get_world_size()
-        torch.distributed.all_gather_object(errors, scoring_error)
-        failed = [error for error in errors if error is not None]
-        if failed:
-            raise RuntimeError(
-                f"Teacher preparation failed before the update: {failed[0]}"
-            )
-        batch.update(
-            teacher_targets_to_batch(
-                targets,
-                batch["prompt_lengths"].tolist(),
-                batch["response_lengths"].tolist(),
-                batch["input_ids"].shape[1] if dynamic else self.response_len,
-                response_only=not dynamic,
-            )
-        )
+        if has_empty_distillation_rank(batch, self.torch_device_type):
+            return None
         return batch
 
     def get_forward_step_func(self):
@@ -277,8 +203,6 @@ class MegatronActor(MegatronWorker):
                 assert logits.shape[:2] == label.shape[:2]
                 assert label.shape == label_mask.shape
 
-                if self._select_distillation_ids:
-                    return {"student_topk_ids": select_student_ids(self, logits)}
                 distribution = {}
                 if (
                     self.distillation_plan.enabled
@@ -331,10 +255,6 @@ class MegatronActor(MegatronWorker):
 
                 # in last stage need to get the log_probs from the output
                 if unwrap_model(model).post_process:
-                    if self._select_distillation_ids:
-                        ids = output["student_topk_ids"]
-                        ids = ids[:, -response_len - 1 : -1]
-                        return ids, id_func
                     mask = batch["response_mask"][:, -response_len:]
                     output = output["log_probs"][:, -response_len - 1 : -1].contiguous()
                     output = output * mask
@@ -400,24 +320,35 @@ class MegatronActor(MegatronWorker):
                         fast_path_zero_loss_mask=True,
                     )
 
-                if self.distillation_plan.enabled:
-                    loss, distill_metrics = combine_actor_distillation(
-                        self, output, batch, loss, dynamic=False
-                    )
-                    metrics_data.update(distill_metrics)
-
-                entropy_loss = torch.zeros(1, device=loss.device)
+                regularization_loss = torch.zeros(1, device=curr_logprobs.device)
+                entropy_loss = torch.zeros_like(regularization_loss)
                 if self.calculate_entropy:
                     entropy = output["entropy"][:, -response_len - 1 : -1].contiguous()
                     entropy_loss = self.loss_agg_func(entropy, mask=mask)
                     if self.calculate_entropy_loss:
-                        loss = loss - self.cfg.algorithm.entropy_bonus * entropy_loss
+                        regularization_loss = (
+                            regularization_loss
+                            - self.cfg.algorithm.entropy_bonus * entropy_loss
+                        )
 
-                kl_loss = torch.tensor(0.0, device=torch.cuda.current_device())
+                kl_loss = torch.tensor(0.0, device=curr_logprobs.device)
                 if self.kl_beta > 0 and ref_logprobs is not None:
                     kld = kl_penalty(curr_logprobs, ref_logprobs, self.kl_penalty_type)
                     kl_loss = self.loss_agg_func(kld, mask)
-                    loss = loss + kl_loss * self.kl_beta
+                    regularization_loss = regularization_loss + kl_loss * self.kl_beta
+
+                if self.distillation_plan.enabled:
+                    loss, distill_metrics = combine_actor_distillation(
+                        self,
+                        output,
+                        batch,
+                        loss,
+                        dynamic=False,
+                        regularization_loss=regularization_loss,
+                    )
+                    metrics_data.update(distill_metrics)
+                else:
+                    loss = loss + regularization_loss
 
                 # Logging and early stopping according to KL (logp vs ref) or importance ratio (new logp vs old logp).
                 if "actor/ratio" in metrics_data:

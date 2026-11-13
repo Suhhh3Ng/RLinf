@@ -52,6 +52,11 @@ class VLLMWorker(Worker):
         self._return_logprobs = self._cfg.rollout.return_logprobs
         self._sampling_params = self._get_sampling_params_from_config()
         self._tokenizer = self._load_tokenizer()
+        from rlinf.workers.teacher.scoring import rollout_topk_count
+
+        self._student_topk_count = rollout_topk_count(self._cfg, self._tokenizer)
+        if self._student_topk_count:
+            self._sampling_params.logprobs = self._student_topk_count
         self._vllm_engine = None
         self._async_engine = None
 
@@ -364,6 +369,8 @@ class VLLMWorker(Worker):
         # `task` was dropped from EngineArgs after 0.8.5; generation is inferred.
         if "task" in {field.name for field in fields(EngineArgs)}:
             engine_kwargs["task"] = "generate"
+        if self._student_topk_count:
+            engine_kwargs["max_logprobs"] = self._student_topk_count
         engine_args: EngineArgs = EngineArgs(**engine_kwargs)
         vllm_config: VllmConfig = engine_args.create_engine_config()
 
@@ -487,9 +494,26 @@ class VLLMWorker(Worker):
             response_ids = list(seq_group_info.results[idx].outputs[0].token_ids)
             if scorer is not None and idx in seq_group_info.idx_completed:
 
-                async def score_one(index=idx, ids=list(response_ids)):
+                async def score_one(
+                    index=idx, ids=list(response_ids), output=request_output
+                ):
+                    from rlinf.workers.teacher.scoring import select_rollout_topk
+
+                    selected = (
+                        select_rollout_topk(
+                            output.outputs[0].logprobs,
+                            len(ids),
+                            scorer.plan.topk,
+                            len(self._tokenizer),
+                        )
+                        if scorer.plan.need_rollout_topk
+                        else None
+                    )
                     return index, await scorer.score_sequence(
-                        list(seq_group_info.input_ids), ids, str(seq_group_info.id)
+                        list(seq_group_info.input_ids),
+                        ids,
+                        str(seq_group_info.id),
+                        selected,
                     )
 
                 teacher_tasks.append(asyncio.create_task(score_one()))
@@ -505,10 +529,7 @@ class VLLMWorker(Worker):
             values = [None] * seq_group_info.group_size
             for index, target in await asyncio.gather(*teacher_tasks):
                 values[index] = target
-            if scorer.plan.need_student_topk_selection:
-                seq_group_info.teacher_requests = values
-            else:
-                seq_group_info.teacher_targets = values
+            seq_group_info.teacher_targets = values
         return seq_group_info
 
     async def rollout(self, input_channel: Channel, output_channel: Channel) -> None:

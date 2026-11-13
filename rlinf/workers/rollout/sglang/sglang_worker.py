@@ -65,6 +65,7 @@ class SGLangWorker(Worker):
         # 'cpu': save weight from cpu and reload weight from cpu
         # None: no need to reload, only used in eval
         self.weight_reload = weight_reload
+        collect_student_topk = config_rollout is None
         if config_rollout is None:
             config_rollout = self._cfg.rollout
         self._cfg_rollout = config_rollout
@@ -83,6 +84,13 @@ class SGLangWorker(Worker):
             trust_remote_code=self._cfg_rollout.model.trust_remote_code,
         )
         self._return_logprobs = self._cfg_rollout.return_logprobs
+        from rlinf.workers.teacher.scoring import rollout_topk_count
+
+        self._student_topk_count = (
+            rollout_topk_count(self._cfg, self._tokenizer)
+            if collect_student_topk
+            else 0
+        )
         sampling_params = None
         if config_rollout is not None:
             sampling_params = config_rollout.get("sampling_params", None)
@@ -327,7 +335,8 @@ class SGLangWorker(Worker):
             image_data=image_data
             if image_data is not None and any(image_data)
             else None,
-            return_logprob=return_logprob,
+            return_logprob=True if self._student_topk_count else return_logprob,
+            top_logprobs_num=self._student_topk_count,
         )
         return result, request_info
 
@@ -599,9 +608,24 @@ class SGLangWorker(Worker):
             response_ids = seq_group_info.results[idx]["output_ids"]
             if scorer is not None and idx in seq_group_info.idx_completed:
 
-                async def score_one(index=idx, ids=list(response_ids)):
+                async def score_one(index=idx, ids=list(response_ids), output=result):
+                    from rlinf.workers.teacher.scoring import select_rollout_topk
+
+                    selected = (
+                        select_rollout_topk(
+                            output["meta_info"].get("output_top_logprobs"),
+                            len(ids),
+                            scorer.plan.topk,
+                            len(self._tokenizer),
+                        )
+                        if scorer.plan.need_rollout_topk
+                        else None
+                    )
                     return index, await scorer.score_sequence(
-                        list(seq_group_info.input_ids), ids, str(seq_group_info.id)
+                        list(seq_group_info.input_ids),
+                        ids,
+                        str(seq_group_info.id),
+                        selected,
                     )
 
                 teacher_tasks.append(asyncio.create_task(score_one()))
@@ -617,10 +641,7 @@ class SGLangWorker(Worker):
             values = [None] * seq_group_info.group_size
             for index, target in await asyncio.gather(*teacher_tasks):
                 values[index] = target
-            if scorer.plan.need_student_topk_selection:
-                seq_group_info.teacher_requests = values
-            else:
-                seq_group_info.teacher_targets = values
+            seq_group_info.teacher_targets = values
         return seq_group_info
 
     async def rollout(self, input_channel: Channel, output_channel: Channel):
@@ -747,13 +768,24 @@ class SGLangWorker(Worker):
                 input_ids=prompt_ids,
                 sampling_params=final_sampling_params,
                 image_data=None,
-                return_logprob=self._return_logprobs,
+                return_logprob=bool(self._return_logprobs or self._student_topk_count),
+                top_logprobs_num=self._student_topk_count,
             )
             # sglang will trim matched stop in result text, so we should only return output_ids
             result_dict = {
                 "output_ids": result["output_ids"],
                 "finish_reason": result["meta_info"]["finish_reason"]["type"],
             }
+            if self._student_topk_count:
+                from rlinf.algorithms.distillation.config import build_distillation_plan
+                from rlinf.workers.teacher.scoring import select_rollout_topk
+
+                result_dict["topk_token_ids"] = select_rollout_topk(
+                    result["meta_info"].get("output_top_logprobs"),
+                    len(result["output_ids"]),
+                    build_distillation_plan(self._cfg).topk,
+                    len(self._tokenizer),
+                )
             if self._return_logprobs:
                 result_dict["logprobs"] = [
                     item[0] for item in result["meta_info"]["output_token_logprobs"]

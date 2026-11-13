@@ -451,6 +451,10 @@ class WideSeekR1AgentLoopWorker(MultiAgentLoopWorker):
                 AgentLoopOutput(
                     prompt_ids=copy.deepcopy(prompt_ids),
                     response_ids=copy.deepcopy(response_ids),
+                    response_topk_token_ids=generate_result.get("topk_token_ids", ())[
+                        : len(response_ids)
+                    ]
+                    or None,
                     prompt_text=copy.deepcopy(self.tokenizer.decode(prompt_ids)),
                     response_text=response_text,
                     is_end=generate_result["finish_reason"] == "length",

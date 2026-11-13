@@ -144,7 +144,7 @@ class DistillationPlan:
     support_source: str = "sampled"
     target_format: str = "sampled"
     scoring_stage: str = "rollout"
-    need_student_topk_selection: bool = False
+    need_rollout_topk: bool = False
     need_current_logprobs: bool = True
     need_old_logprobs: bool = True
     need_task_rewards: bool = True
@@ -208,8 +208,8 @@ def build_distillation_plan(cfg: Mapping) -> DistillationPlan:
         else "sparse"
         if distribution
         else "sampled",
-        scoring_stage="pre_update" if source == "student" else "rollout",
-        need_student_topk_selection=source == "student",
+        scoring_stage="rollout",
+        need_rollout_topk=source == "student",
         need_current_logprobs=not distribution
         or loss.use_policy_gradient
         or loss.use_task_rewards

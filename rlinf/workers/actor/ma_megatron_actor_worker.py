@@ -63,7 +63,6 @@ from rlinf.workers.actor.megatron_actor_worker import (
 from rlinf.workers.actor.megatron_distillation import (
     combine_actor_distillation,
     distribution_processor,
-    select_student_ids,
     teacher_processor_args,
 )
 
@@ -154,8 +153,6 @@ class MAMegatronActor(MegatronActor):
                 assert logits.shape[:2] == label.shape[:2]
                 assert label.shape == label_mask.shape
 
-                if self._select_distillation_ids:
-                    return {"student_topk_ids": select_student_ids(self, logits)}
                 distribution = {}
                 if (
                     self.distillation_plan.enabled
@@ -207,12 +204,6 @@ class MAMegatronActor(MegatronActor):
 
                 # in last stage need to get the log_probs from the output
                 if unwrap_model(model).post_process:
-                    if self._select_distillation_ids:
-                        ids = output["student_topk_ids"]
-                        shifted = torch.zeros_like(ids)
-                        shifted[:, 1:] = ids[:, :-1]
-                        ids = shifted
-                        return ids, id_func
                     output = output["log_probs"]
                     output = output.clone()
                     output[:, 1:] = output[:, :-1].clone()
@@ -279,24 +270,35 @@ class MAMegatronActor(MegatronActor):
                         fast_path_zero_loss_mask=True,
                     )
 
-                if self.distillation_plan.enabled:
-                    loss, distill_metrics = combine_actor_distillation(
-                        self, output, batch, loss, dynamic=True
-                    )
-                    metrics_data.update(distill_metrics)
-
-                entropy_loss = torch.zeros(1, device=loss.device)
+                regularization_loss = torch.zeros(1, device=curr_logprobs.device)
+                entropy_loss = torch.zeros_like(regularization_loss)
                 if self.calculate_entropy:
                     entropy = output["entropy"]
                     entropy_loss = self.loss_agg_func(entropy, mask=mask)
                     if self.calculate_entropy_loss:
-                        loss = loss - self.cfg.algorithm.entropy_bonus * entropy_loss
+                        regularization_loss = (
+                            regularization_loss
+                            - self.cfg.algorithm.entropy_bonus * entropy_loss
+                        )
 
-                kl_loss = torch.tensor(0.0, device=torch.cuda.current_device())
+                kl_loss = torch.tensor(0.0, device=curr_logprobs.device)
                 if self.kl_beta > 0 and ref_logprobs is not None:
                     kld = kl_penalty(curr_logprobs, ref_logprobs, self.kl_penalty_type)
                     kl_loss = self.loss_agg_func(kld * batch["loss_scales"], mask)
-                    loss = loss + kl_loss * self.kl_beta
+                    regularization_loss = regularization_loss + kl_loss * self.kl_beta
+
+                if self.distillation_plan.enabled:
+                    loss, distill_metrics = combine_actor_distillation(
+                        self,
+                        output,
+                        batch,
+                        loss,
+                        dynamic=True,
+                        regularization_loss=regularization_loss,
+                    )
+                    metrics_data.update(distill_metrics)
+                else:
+                    loss = loss + regularization_loss
 
                 # all gather
                 if "actor/ratio" in metrics_data:
@@ -454,6 +456,11 @@ class MAMegatronActor(MegatronActor):
         )
         if self.distillation_plan.enabled:
             batch = self.prepare_distillation_targets(batch)
+            if batch is None:
+                self.log_warning(
+                    "Skipping update: an Actor rank has no retained sequences"
+                )
+                return {"skipped_empty_batch": 1.0}, None
         if self.distillation_plan.need_old_logprobs:
             assert "recomputed_logprobs" in batch or "rollout_logprobs" in batch
         # Compute advantages and returns

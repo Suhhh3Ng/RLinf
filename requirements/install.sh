@@ -1609,6 +1609,7 @@ install_sglang() {
         fi
         install_engine_requirements "$extra_req"
     done
+    bash "$SCRIPT_DIR/patches/apply_sglang.sh"
     echo "[install.sh] Installed sglang ${version}${*:+ with extras: $*} for $(agentic_cuda_line)."
 }
 

@@ -1,7 +1,7 @@
 数学推理
 ========
 
-面向大语言模型的数学推理强化学习训练——基于 Qwen 与 DeepSeek-V3（Moonlight-16B）架构的 GRPO 与 PPO——使用 Megatron-Bridge actor 与 SGLang rollout。
+面向大语言模型的数学推理强化学习训练，涵盖使用 Megatron-Bridge actor 与 SGLang rollout 的 Qwen、DeepSeek-V3（Moonlight-16B）GRPO 与 PPO 示例。若使用 Teacher 指导训练，可选择采用 FSDP Actor 的同步 LLM 蒸馏示例。
 
 .. raw:: html
 
@@ -40,6 +40,14 @@
      </div>
    </div>
 
+.. list-table:: Teacher 指导训练
+   :header-rows: 1
+
+   * - 示例
+     - 适用场景
+   * - :doc:`LLM On-Policy 蒸馏 <opd>`
+     - 用冻结 Teacher 对 Student 自己生成的回答评分并训练。
+
 .. toctree::
    :hidden:
    :maxdepth: 1
@@ -47,3 +55,4 @@
    Qwen2.5 GRPO <reasoning>
    Qwen2.5 PPO <reasoning_ppo>
    Moonlight-16B GRPO <moonlight>
+   LLM On-Policy 蒸馏 <opd>

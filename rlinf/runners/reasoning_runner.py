@@ -714,7 +714,10 @@ class ReasoningRunner:
 
                 logging_metrics = {f"{k}_time": v for k, v in time_metrics.items()}
 
-                if self.cfg.actor.get("calculate_flops", False):
+                if (
+                    self.cfg.actor.get("calculate_flops", False)
+                    and actor_training_metrics is not None
+                ):
                     flops_metrics = self._compute_flops_metrics(
                         time_metrics, actor_rollout_metrics
                     )

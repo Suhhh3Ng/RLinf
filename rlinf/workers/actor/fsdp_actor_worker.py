@@ -79,7 +79,10 @@ from rlinf.utils.utils import (
     masked_mean,
     retrieve_model_state_dict_in_cpu,
 )
-from rlinf.workers.actor.distillation import fsdp_distillation_forward
+from rlinf.workers.actor.distillation import (
+    fsdp_distillation_forward,
+    has_empty_distillation_rank,
+)
 from rlinf.workers.rollout.utils import (
     RankMapper,
     instance_ids_to_entry_process_ranks,
@@ -470,7 +473,6 @@ class FSDPActor(FSDPModelManager, Worker):
         calculate_entropy: bool = False,
         *,
         distillation: bool = False,
-        select_ids: bool = False,
     ) -> torch.Tensor:
         input_ids = m_batch["input_ids"]
         attention_mask = m_batch["attention_mask"]
@@ -536,7 +538,6 @@ class FSDPActor(FSDPModelManager, Worker):
                 starts=starts,
                 ends=ends,
                 response_only=True,
-                select_ids=select_ids,
             )
 
         if self.enable_dynamic_batch_size or self.variable_seq_lengths:
@@ -580,107 +581,11 @@ class FSDPActor(FSDPModelManager, Worker):
         self._teacher_endpoints = endpoints
         self._student_policy_version = student_policy_version
 
-    def prepare_distillation_targets(self, batch):
-        """Freeze this round's Student support before the first optimizer update."""
-        if not self.distillation_plan.need_student_topk_selection:
-            return batch
-        import asyncio
-        from dataclasses import replace
+    def prepare_distillation_targets(self, batch: dict) -> dict | None:
+        """Coordinate ready rollout targets, skipping all ranks if any is empty."""
 
-        from rlinf.data.schema.distillation import teacher_targets_to_batch
-        from rlinf.workers.teacher.client import TeacherClient
-
-        requests = batch.pop("teacher_requests")
-        if any(
-            request.student_policy_version != self._student_policy_version
-            for request in requests
-        ):
-            raise ValueError(
-                "Student top-k requests must match the current rollout weight version"
-            )
-        self._load_weight_and_optimizer()
-        was_training = self.model.training
-        self.model.eval()
-        count = torch.tensor(len(requests), device=Worker.torch_device_type)
-        torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.MAX)
-        scored_requests = []
-        try:
-            with torch.no_grad():
-                for index in range(int(count.item())):
-                    row = min(index, len(requests) - 1)
-                    if row < 0:
-                        raise ValueError(
-                            "Student selection requires at least one sequence per rank"
-                        )
-                    microbatch = {
-                        key: value[row : row + 1].to(Worker.torch_device_type)
-                        if isinstance(value, torch.Tensor)
-                        else value[row : row + 1]
-                        for key, value in batch.items()
-                    }
-                    selected = self.forward_batch(
-                        microbatch, distillation=True, select_ids=True
-                    ).cpu()[0]
-                    if index >= len(requests):
-                        continue
-                    request = requests[index]
-                    prompt = int(batch["prompt_lengths"][index])
-                    response = int(batch["response_lengths"][index])
-                    dynamic = bool(getattr(self, "is_dynamic_rollout_batch", False))
-                    raw_ids = (
-                        selected[: prompt + response]
-                        if dynamic
-                        else torch.cat(
-                            (
-                                torch.zeros(
-                                    (prompt, selected.shape[-1]), dtype=torch.long
-                                ),
-                                selected[:response],
-                            )
-                        )
-                    )
-                    scored_requests.append(
-                        replace(
-                            request,
-                            selected_token_ids=tuple(
-                                tuple(row) for row in raw_ids.tolist()
-                            ),
-                        )
-                    )
-        finally:
-            self.model.train(was_training)
-
-        async def score_all():
-            client = TeacherClient(self._teacher_endpoints)
-            try:
-                return await asyncio.gather(
-                    *(client.score(request) for request in scored_requests)
-                )
-            finally:
-                await client.close()
-
-        targets, scoring_error = None, None
-        try:
-            targets = asyncio.run(score_all())
-        except Exception as error:
-            scoring_error = f"{type(error).__name__}: {error}"
-        errors = [None] * torch.distributed.get_world_size()
-        torch.distributed.all_gather_object(errors, scoring_error)
-        failed = [error for error in errors if error is not None]
-        if failed:
-            raise RuntimeError(
-                f"Teacher preparation failed before the update: {failed[0]}"
-            )
-        dynamic = bool(getattr(self, "is_dynamic_rollout_batch", False))
-        batch.update(
-            teacher_targets_to_batch(
-                targets,
-                batch["prompt_lengths"].tolist(),
-                batch["response_lengths"].tolist(),
-                batch["input_ids"].shape[1] if dynamic else self.response_len,
-                response_only=not dynamic,
-            )
-        )
+        if has_empty_distillation_rank(batch, Worker.torch_device_type):
+            return None
         return batch
 
     def forward_training_batch(self, batch, plan=None):
@@ -1142,7 +1047,7 @@ class FSDPActor(FSDPModelManager, Worker):
     @Worker.timer("run_training")
     def run_training(
         self, input_channel: Channel, do_offload=False
-    ) -> tuple[dict, list]:
+    ) -> tuple[dict, list | None]:
         # Get all batches for this DP
         assert not do_offload, (
             "do_offload argument of run_inference/run_training is not supported in FSDP for now"
@@ -1163,6 +1068,11 @@ class FSDPActor(FSDPModelManager, Worker):
         global_batch = RolloutResult.merge_batches(batches)
         if self.distillation_plan.enabled:
             global_batch = self.prepare_distillation_targets(global_batch)
+            if global_batch is None:
+                self.log_warning(
+                    "Skipping update: an Actor rank has no retained sequences"
+                )
+                return {"skipped_empty_batch": 1.0}, None
 
         if self.distillation_plan.need_old_logprobs:
             assert (

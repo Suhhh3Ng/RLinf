@@ -24,6 +24,7 @@ class SGLangTeacherBackend(TeacherScoringBackend):
 
     async def initialize(self) -> TeacherModelInfo:
         from sglang import Engine
+        from sglang.srt.server_args import ServerArgs
 
         info = self.load_model_info()
         options = dict(self.config.inference.get("engine_kwargs", {}))
@@ -33,14 +34,19 @@ class SGLangTeacherBackend(TeacherScoringBackend):
             pp_size=self.config.inference.get("pipeline_parallel_size", 1),
             context_length=info.max_context_length,
         )
+        self.supports_position_scores = (
+            "selected_token_logprob_vocab_size" in ServerArgs.__dataclass_fields__
+        )
+        if self.supports_position_scores:
+            options["selected_token_logprob_vocab_size"] = info.vocab_size
         self.engine = Engine(**options)
         return info
 
     async def score(self, request: TeacherScoreRequest) -> TeacherTargets:
         self.validate_request(request)
-        if request.selected_token_ids is not None or (
-            request.topk is not None and self.has_extra_model_tokens
-        ):
+        if request.selected_token_ids is not None:
+            return await self.score_selected(request)
+        if request.topk is not None and self.has_extra_model_tokens:
             return await self.score_response_tokens(request)
         full = request.topk == -1
         count = self.info.vocab_size if full else request.topk or 0
@@ -64,12 +70,53 @@ class SGLangTeacherBackend(TeacherScoringBackend):
             ]
         return self.normalize(request, rows)
 
+    async def score_selected(self, request: TeacherScoreRequest) -> TeacherTargets:
+        """Score fixed rollout support in one prefill, gathering inside the engine."""
+        if not getattr(self, "supports_position_scores", False):
+            raise ValueError(
+                "Student top-k requires the SGLang per-position scoring patch; "
+                "run bash requirements/patches/apply_sglang.sh in a SGLang 0.5.12.post1 environment"
+            )
+        width = request.topk
+        # Prefill row t predicts input token t+1; the final row has no target.
+        ids = [i for row in request.selected_token_ids[1:] for i in row] + [0] * width
+        output = await self.engine.async_generate(
+            input_ids=list(request.input_ids),
+            sampling_params={
+                "temperature": 1.0,
+                "max_new_tokens": 0,
+                "custom_params": {"rlinf_token_ids_logprob_k": width},
+            },
+            return_logprob=True,
+            logprob_start_len=0,
+            top_logprobs_num=0,
+            token_ids_logprob=ids,
+        )
+        scores = output["meta_info"]["input_token_ids_logprobs"]
+        if len(scores) != len(request.input_ids):
+            raise ValueError(
+                "Teacher prefill scores must match the original input length"
+            )
+        rows = []
+        for position, row in enumerate(scores):
+            if not request.response_mask[position] or position == 0:
+                rows.append(None)
+                continue
+            actual_ids = tuple(int(item[1]) for item in row)
+            if actual_ids != request.selected_token_ids[position]:
+                raise ValueError(
+                    f"Teacher request {request.request_id}: per-position scoring IDs differ at position {position}"
+                )
+            rows.append({int(item[1]): float(item[0]) for item in row})
+        return self.normalize(request, rows)
+
     async def score_next(
         self, prefix: tuple[int, ...], selected_ids: tuple[int, ...], request_id: str
     ) -> dict[int, float]:
         output = await self.engine.async_generate(
             input_ids=list(prefix),
-            sampling_params={"temperature": 1.0, "max_new_tokens": 1},
+            # Greedy scoring uses raw log_softmax, avoiding softmax underflow.
+            sampling_params={"temperature": 0.0, "max_new_tokens": 1},
             return_logprob=True,
             logprob_start_len=-1,
             top_logprobs_num=0,

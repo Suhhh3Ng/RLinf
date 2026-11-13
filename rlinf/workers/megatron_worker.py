@@ -748,6 +748,11 @@ class MegatronWorker(MegatronModelManager, Worker):
 
         if self.distillation_plan.enabled:
             batch = self.prepare_distillation_targets(batch)
+            if batch is None:
+                self.log_warning(
+                    "Skipping update: an Actor rank has no retained sequences"
+                )
+                return {"skipped_empty_batch": 1.0}, None
         if self.distillation_plan.need_old_logprobs:
             assert "recomputed_logprobs" in batch or "rollout_logprobs" in batch
         # Compute advantages and returns

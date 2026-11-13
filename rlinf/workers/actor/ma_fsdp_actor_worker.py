@@ -127,7 +127,6 @@ class MAFSDPActor(FSDPActor):
         calculate_entropy: bool = False,
         *,
         distillation: bool = False,
-        select_ids: bool = False,
     ) -> torch.Tensor:
         input_ids = m_batch["input_ids"]
         attention_mask = m_batch["attention_mask"]
@@ -202,7 +201,6 @@ class MAFSDPActor(FSDPActor):
                 starts=starts,
                 ends=ends,
                 response_only=False,
-                select_ids=select_ids,
             )
 
         if self.enable_dynamic_batch_size:
@@ -588,7 +586,7 @@ class MAFSDPActor(FSDPActor):
 
     def run_training(
         self, input_channel: Channel, do_offload=False
-    ) -> tuple[dict, list]:
+    ) -> tuple[dict, list | None]:
         assert not do_offload, (
             "do_offload argument of run_inference/run_training is not supported in FSDP for now"
         )
@@ -608,6 +606,11 @@ class MAFSDPActor(FSDPActor):
         )
         if self.distillation_plan.enabled:
             global_batch = self.prepare_distillation_targets(global_batch)
+            if global_batch is None:
+                self.log_warning(
+                    "Skipping update: an Actor rank has no retained sequences"
+                )
+                return {"skipped_empty_batch": 1.0}, None
         if self.distillation_plan.need_old_logprobs:
             assert (
                 "recomputed_logprobs" in global_batch

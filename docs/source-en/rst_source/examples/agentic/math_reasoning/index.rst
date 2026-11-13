@@ -3,7 +3,8 @@ Math Reasoning
 
 RL training for math reasoning on large language models — GRPO and PPO on
 Qwen-based and DeepSeek-V3 (Moonlight-16B) architectures — using the
-Megatron-Bridge actor with SGLang rollout.
+Megatron-Bridge actor with SGLang rollout. For Teacher-guided training, use
+the synchronous LLM distillation example with an FSDP Actor.
 
 .. raw:: html
 
@@ -42,6 +43,14 @@ Megatron-Bridge actor with SGLang rollout.
      </div>
    </div>
 
+.. list-table:: Teacher-Guided Training
+   :header-rows: 1
+
+   * - Example
+     - Use It For
+   * - :doc:`LLM On-Policy Distillation <opd>`
+     - Training a Student on its own responses using a frozen Teacher.
+
 .. toctree::
    :hidden:
    :maxdepth: 1
@@ -49,3 +58,4 @@ Megatron-Bridge actor with SGLang rollout.
    Qwen2.5 GRPO <reasoning>
    Qwen2.5 PPO <reasoning_ppo>
    Moonlight-16B GRPO <moonlight>
+   LLM On-Policy Distillation <opd>

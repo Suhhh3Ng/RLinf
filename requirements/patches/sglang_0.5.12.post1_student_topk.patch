@@ -1,0 +1,226 @@
+# Per-position scoring adapted from Relax (Apache-2.0), commit 7033d07.
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+# Modifications Copyright 2026 The RLinf Authors.
+# Source: https://github.com/redai-studio/Relax/blob/7033d07/docker/patch/latest/sglang_per_pos_topk.patch
+# Ported to SGLang 0.5.12.post1 with effective-vocabulary normalization.
+--- a/srt/server_args.py
++++ b/srt/server_args.py
+@@ -366,6 +366,7 @@
+
+     # Model and tokenizer
+     model_path: str
++    selected_token_logprob_vocab_size: Optional[int] = None
+     tokenizer_path: Optional[str] = None
+     tokenizer_mode: str = "auto"
+     tokenizer_backend: str = "huggingface"
+--- a/srt/layers/logits_processor.py
++++ b/srt/layers/logits_processor.py
+@@ -276,6 +276,7 @@
+
+         self.return_full_logits = return_full_logits
+         self.enable_mis = get_global_server_args().enable_mis
++        self.selected_token_logprob_vocab_size = get_global_server_args().selected_token_logprob_vocab_size
+
+         # enable chunked logprobs processing
+         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
+@@ -645,7 +646,10 @@
+             (
+                 input_token_ids_logprobs_val,
+                 input_token_ids_logprobs_idx,
+-            ) = get_token_ids_logprobs_prefill(input_logprobs, logits_metadata)
++            ) = get_token_ids_logprobs_prefill(
++                input_logprobs, logits_metadata,
++                vocab_size=self.selected_token_logprob_vocab_size,
++            )
+         else:
+             input_token_ids_logprobs_val = input_token_ids_logprobs_idx = None
+
+@@ -808,6 +812,7 @@
+                     input_token_ids_logprobs_val,
+                     input_token_ids_logprobs_idx,
+                     split_len_token_ids,
++                    vocab_size=self.selected_token_logprob_vocab_size,
+                 )
+
+             # Get the logprob of the requested token ids
+--- a/srt/layers/utils/logprob.py
++++ b/srt/layers/utils/logprob.py
+@@ -128,6 +128,7 @@
+     stage: LogprobStage,
+     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None,
+     no_copy_to_cpu: bool = False,
++    vocab_size: Optional[int] = None,
+ ):
+     vals, idxs = [], []
+     if stage == LogprobStage.DECODE:
+@@ -136,6 +137,8 @@
+                 vals.append([])
+                 idxs.append([])
+             else:
++                if token_ids and isinstance(token_ids[0], list):
++                    token_ids = token_ids[-1]
+                 token_ids_tensor = torch.tensor(token_ids, dtype=torch.long).to(
+                     logprobs.device, non_blocking=True
+                 )
+@@ -154,15 +157,24 @@
+             token_ids_tensor = torch.tensor(token_ids, dtype=torch.long).to(
+                 logprobs.device, non_blocking=True
+             )
+-            pos_logprobs = logprobs[pt : pt + pruned_len, token_ids_tensor]
++            if token_ids_tensor.ndim == 2:
++                assert token_ids_tensor.shape[0] == pruned_len
++                block = logprobs[pt : pt + pruned_len]
++                pos_logprobs = block.gather(1, token_ids_tensor)
++                if vocab_size is not None:
++                    pos_logprobs = pos_logprobs - block[:, :vocab_size].logsumexp(-1, keepdim=True)
++                row_ids = token_ids
++            else:
++                pos_logprobs = logprobs[pt : pt + pruned_len, token_ids_tensor]
++                row_ids = [token_ids for _ in range(pruned_len)]
+             vals.append(pos_logprobs if no_copy_to_cpu else pos_logprobs.tolist())
+-            idxs.append([token_ids for _ in range(pruned_len)])
++            idxs.append(row_ids)
+             pt += pruned_len
+     return vals, idxs
+
+
+ def get_token_ids_logprobs_prefill(
+-    all_logprobs, logits_metadata: LogitsMetadata, no_copy_to_cpu=False
++    all_logprobs, logits_metadata: LogitsMetadata, no_copy_to_cpu=False, vocab_size=None
+ ):
+     return get_token_ids_logprobs_raw(
+         all_logprobs,
+@@ -170,6 +182,7 @@
+         stage=LogprobStage.PREFILL,
+         extend_logprob_pruned_lens_cpu=logits_metadata.extend_logprob_pruned_lens_cpu,
+         no_copy_to_cpu=no_copy_to_cpu,
++        vocab_size=vocab_size,
+     )
+
+
+@@ -263,6 +276,7 @@
+     input_token_ids_logprobs_val: List,
+     input_token_ids_logprobs_idx: List,
+     split_pruned_len: int = 0,
++    vocab_size: Optional[int] = None,
+ ):
+     """Get token_ids logprobs for each sequence in the chunk.
+
+@@ -307,14 +321,28 @@
+         # Get the token ids logprobs
+         val = []
+         idx = []
+-        for j in range(pruned_len):
+-            # Handle remaining tokens in next chunk if any
+-            if pt + j >= logprobs.shape[0]:
+-                next_split_pruned_len = split_pruned_len + j
+-                break
+-            if token_ids is not None:
+-                val.append(logprobs[pt + j, token_ids].tolist())
+-                idx.append(token_ids)
++        if token_ids and isinstance(token_ids[0], list):
++            assert len(token_ids) == pruned_len + split_pruned_len
++            take = min(pruned_len, max(logprobs.shape[0] - pt, 0))
++            idx = token_ids[split_pruned_len : split_pruned_len + take]
++            if take:
++                query = torch.tensor(idx, dtype=torch.long, device=logprobs.device)
++                block = logprobs[pt : pt + take]
++                values = block.gather(1, query)
++                if vocab_size is not None:
++                    values = values - block[:, :vocab_size].logsumexp(-1, keepdim=True)
++                val = values.tolist()
++            if take < pruned_len:
++                next_split_pruned_len = split_pruned_len + take
++        else:
++            for j in range(pruned_len):
++                # Handle remaining tokens in next chunk if any
++                if pt + j >= logprobs.shape[0]:
++                    next_split_pruned_len = split_pruned_len + j
++                    break
++                if token_ids is not None:
++                    val.append(logprobs[pt + j, token_ids].tolist())
++                    idx.append(token_ids)
+
+         # Append or extend based on whether the sequence was split across chunks
+         if len(val) > 0:
+--- a/srt/layers/sampler.py
++++ b/srt/layers/sampler.py
+@@ -117,6 +117,12 @@
+
+         # Preprocess logits (custom processors and NaN handling)
+         logits = self._preprocess_logits(logits, sampling_info)
++        stable_topk_logprobs = None
++        if (return_logprob and any(k > 0 for k in top_logprobs_nums)
++            and not sampling_info.is_all_greedy
++            and not SGLANG_RETURN_ORIGINAL_LOGPROB
++            and self.rl_on_policy_target is None):
++            stable_topk_logprobs = torch.log_softmax(logits / sampling_info.temperatures, dim=-1)
+
+         if sampling_info.is_all_greedy:
+             # Use torch.argmax if all requests use greedy sampling
+@@ -189,6 +195,8 @@
+         if return_logprob:
+             if SGLANG_RETURN_ORIGINAL_LOGPROB:
+                 logprobs = original_logprobs
++            elif stable_topk_logprobs is not None:
++                logprobs = stable_topk_logprobs
+             self._attach_logprobs_to_output(
+                 logits_output,
+                 logprobs,
+@@ -664,6 +672,7 @@
+         # values = [tensor([-2.1, -3.0]), tensor([-2.2]), tensor([-2.0, -1.4, -1.6])]
+         # indices = [[1, 3], [2], [0, 2, 4]]
+     """
++    token_ids_logprobs = [ids[-1] if ids and isinstance(ids[0], list) else ids for ids in token_ids_logprobs]
+     batch_size = len(token_ids_logprobs)
+     device = logprobs.device
+
+--- a/srt/managers/schedule_batch.py
++++ b/srt/managers/schedule_batch.py
+@@ -1961,7 +1961,19 @@
+
+         if self.return_logprob:
+             self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+-            self.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
++            self.token_ids_logprobs = []
++            for req in reqs:
++                ids = req.token_ids_logprob
++                width = (req.sampling_params.custom_params or {}).get("rlinf_token_ids_logprob_k")
++                if width is None:
++                    self.token_ids_logprobs.append(ids)
++                    continue
++                rows = req.extend_input_len - req.extend_logprob_start_len
++                first = len(req.prefix_indices) + req.extend_logprob_start_len - req.logprob_start_len
++                assert 0 <= first and (first + rows) * width <= len(ids)
++                self.token_ids_logprobs.append(
++                    [ids[i * width : (i + 1) * width] for i in range(first, first + rows)]
++                )
+
+         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
+         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
+--- a/srt/managers/tokenizer_manager.py
++++ b/srt/managers/tokenizer_manager.py
+@@ -987,6 +987,23 @@
+         sampling_params = self.sampling_params_class(**sampling_kwargs)
+         sampling_params.normalize(self.tokenizer)
+         sampling_params.verify(self.model_config.vocab_size)
++        width = (sampling_params.custom_params or {}).get("rlinf_token_ids_logprob_k")
++        if width is not None:
++            if type(width) is not int or width <= 0:
++                raise ValueError("rlinf_token_ids_logprob_k must be a positive integer")
++            if (not isinstance(obj, GenerateReqInput) or not obj.return_logprob
++                or sampling_params.max_new_tokens != 0 or input_ids is None
++                or obj.logprob_start_len is None
++                or not 0 <= obj.logprob_start_len < len(input_ids)):
++                raise ValueError("Per-position scoring requires prefill-only input logprobs with a valid start")
++            ids = obj.token_ids_logprob
++            expected = (len(input_ids) - obj.logprob_start_len) * width
++            limit = self.server_args.selected_token_logprob_vocab_size or self.model_config.vocab_size
++            if not 0 < limit <= self.model_config.vocab_size:
++                raise ValueError("Selected-token normalization vocabulary exceeds the model vocabulary")
++            if (not isinstance(ids, list) or len(ids) != expected
++                or any(type(i) is not int or not 0 <= i < limit for i in ids)):
++                raise ValueError(f"Per-position scoring requires exactly {expected} valid token IDs")
+
+         # Build return object
+         if isinstance(obj, GenerateReqInput):

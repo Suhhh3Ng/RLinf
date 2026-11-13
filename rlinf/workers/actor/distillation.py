@@ -21,6 +21,13 @@ from rlinf.algorithms.distillation.fsdp import compute_distribution_loss
 from rlinf.algorithms.distillation.losses import DistillationForwardOutput
 
 
+def has_empty_distillation_rank(batch: dict, device: str) -> bool:
+    """Coordinate empty batches across all Actor ranks before model collectives."""
+    empty = torch.tensor(batch["input_ids"].numel() == 0, device=device)
+    torch.distributed.all_reduce(empty, op=torch.distributed.ReduceOp.MAX)
+    return bool(empty.item())
+
+
 def fsdp_distillation_forward(
     actor,
     logits: torch.Tensor,
@@ -30,7 +37,6 @@ def fsdp_distillation_forward(
     starts,
     ends,
     response_only: bool,
-    select_ids: bool = False,
 ):
     """Consume logits using the same sequence spans as the model's packing.
 
@@ -44,26 +50,19 @@ def fsdp_distillation_forward(
     offset = full_length - width
     shape = (len(starts), width)
     vocab = len(actor.tokenizer)
-    if (
-        select_ids or plan.canonical_loss_mode in DISTRIBUTION_MODES
-    ) and config.topk > vocab:
+    if plan.canonical_loss_mode in DISTRIBUTION_MODES and config.topk > vocab:
         raise ValueError(f"Expected topk <= vocabulary size {vocab}, got {config.topk}")
-    if select_ids:
-        ids_output = torch.zeros(
-            (*shape, config.topk), dtype=torch.long, device=logits.device
+    fields = {
+        name: logits.new_zeros(shape, dtype=torch.float32)
+        for name in (
+            "logprobs",
+            "entropy",
+            "distribution_losses",
+            "student_mass",
+            "teacher_mass",
+            "tail_loss",
         )
-    else:
-        fields = {
-            name: logits.new_zeros(shape, dtype=torch.float32)
-            for name in (
-                "logprobs",
-                "entropy",
-                "distribution_losses",
-                "student_mass",
-                "teacher_mass",
-                "tail_loss",
-            )
-        }
+    }
     cursor = 0
     for row, (start, end) in enumerate(zip(starts, ends)):
         start, end = int(start), int(end)
@@ -77,13 +76,6 @@ def fsdp_distillation_forward(
                 :,
             ]
             destination = slice(left - offset, right - offset)
-            if select_ids:
-                ids_output[row, destination] = (
-                    z[..., :vocab]
-                    .detach()
-                    .argsort(dim=-1, descending=True, stable=True)[..., : config.topk]
-                )
-                continue
             mask = batch["response_mask"][row, left:right].bool().to(z.device)
             mask = mask & batch["teacher_valid_mask"][row, destination].to(z.device)
             if plan.need_current_logprobs:
@@ -112,8 +104,6 @@ def fsdp_distillation_forward(
                 ):
                     fields[name][row, destination] = getattr(output, name)
         cursor += end - start
-    if select_ids:
-        return ids_output
     # Preserve a backward path even when every token in this microbatch is masked.
     zero = logits[..., :1].float().sum() * 0
     fields = {key: value + zero for key, value in fields.items()}

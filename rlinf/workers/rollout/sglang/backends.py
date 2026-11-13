@@ -86,6 +86,7 @@ class SGLangEngineBackend(RolloutBackend):
         sampling_params: list[dict] | dict,
         image_data: Optional[list],
         return_logprob: list[bool] | bool,
+        top_logprobs_num: int = 0,
     ) -> dict:
         return await self.engine.async_generate(
             prompt=prompt,
@@ -93,6 +94,7 @@ class SGLangEngineBackend(RolloutBackend):
             input_ids=input_ids,
             image_data=image_data,
             return_logprob=return_logprob,
+            top_logprobs_num=top_logprobs_num,
         )
 
     async def sync_weights(self) -> None:
@@ -255,6 +257,7 @@ class SGLangServerBackend(RolloutBackend):
         sampling_params: list[dict] | dict,
         image_data: Optional[list],
         return_logprob: list[bool] | bool,
+        top_logprobs_num: int = 0,
     ) -> dict:
         # A request can still race the server closing an idle keep-alive
         # connection, or hit a transient disconnect. Resending only draws
@@ -268,6 +271,7 @@ class SGLangServerBackend(RolloutBackend):
                     input_ids=input_ids,
                     sampling_params=sampling_params,
                     return_logprob=return_logprob,
+                    top_logprobs_num=top_logprobs_num,
                     image_data=image_data,
                 )
             except aiohttp.ClientConnectionError as e:
@@ -281,6 +285,7 @@ class SGLangServerBackend(RolloutBackend):
             input_ids=input_ids,
             sampling_params=sampling_params,
             return_logprob=return_logprob,
+            top_logprobs_num=top_logprobs_num,
             image_data=image_data,
         )
 

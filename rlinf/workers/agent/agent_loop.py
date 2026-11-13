@@ -15,6 +15,7 @@
 import asyncio
 import copy
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Optional
 from uuid import uuid4
@@ -45,6 +46,9 @@ class AgentLoopOutput:
     prompt_ids: list[int]
     """Response token ids including LLM generated token, tool response token."""
     response_ids: list[int]
+    response_topk_token_ids: Sequence[Sequence[int]] | None = field(
+        default=None, kw_only=True
+    )
     teacher_targets: object | None = None
     teacher_request: object | None = None
     student_policy_version: str | None = None
@@ -421,6 +425,11 @@ class AgentLoopWorker(Worker):
             llm_response_text,
         )
         append_ids = llm_response_ids + tool_response_ids
+        if generate_context.get("response_topk_token_ids"):
+            generate_context["response_topk_token_ids"].extend(
+                [generate_context["response_topk_token_ids"][0]]
+                * len(tool_response_ids)
+            )
         append_mask = llm_response_mask + tool_response_mask
         append_logprobs = None
         if self.return_logprobs:
@@ -468,6 +477,7 @@ class AgentLoopWorker(Worker):
             prompt_ids=problem_prompt_ids,
             prompt_text=self.tokenizer.decode(problem_prompt_ids),
             response_ids=response_ids,
+            response_topk_token_ids=generate_context.get("response_topk_token_ids"),
             response_text=self.tokenizer.decode(response_ids),
             response_mask=response_mask,
             trace_prints=trace_prints,
