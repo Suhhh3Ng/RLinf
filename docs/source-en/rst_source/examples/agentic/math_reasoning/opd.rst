@@ -175,6 +175,11 @@ policy-gradient objective. This requires sampling with ``do_sample: true``,
 ``repetition_penalty: 1.0``. For SGLang rollout, also check any overrides in
 ``rollout.sampling_params``. The Teacher scores raw model probabilities.
 
+Policy-gradient training also requires old Student logprobs. Set either
+``rollout.return_logprobs: true`` to collect them during generation or
+``algorithm.recompute_logprobs: true`` to recompute them before the Actor update.
+The supplied config disables both for direct distillation.
+
 For joint training, set ``use_task_rewards: true`` and configure the task's
 reward, advantage, and PPO settings as in :doc:`reasoning`. The objective is
 the task loss plus ``distillation_loss_coef`` times the distillation loss;

@@ -663,6 +663,67 @@ class TestTeacherClient(unittest.IsolatedAsyncioTestCase):
             await client.close()
 
 
+class TestTeacherHTTP(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from aiohttp import web
+
+        from rlinf.utils.logging import get_logger
+        from rlinf.workers.teacher.teacher_worker import TeacherWorker
+
+        class Engine:
+            reverse_ids = False
+
+            async def async_generate(self, **kwargs):
+                width = kwargs["sampling_params"]["custom_params"][
+                    "rlinf_token_ids_logprob_k"
+                ]
+                ids = kwargs["token_ids_logprob"]
+                rows = [None]
+                for position in range(len(kwargs["input_ids"]) - 1):
+                    selected = ids[position * width : (position + 1) * width]
+                    if self.reverse_ids:
+                        selected = selected[::-1]
+                    rows.append([(-2.0, token, None) for token in selected])
+                return {"meta_info": {"input_token_ids_logprobs": rows}}
+
+        backend = SGLangTeacherBackend(TeacherModelConfig("unused"), "default")
+        backend.info = TeacherModelInfo("model", "tokenizer", 5, 32)
+        backend.engine = self.engine = Engine()
+        backend.supports_position_scores = True
+        worker = object.__new__(TeacherWorker)
+        worker.backend = backend
+        worker.teacher_key = "default"
+        worker._limit = asyncio.Semaphore(1)
+        worker._logger = get_logger()
+        worker._stacklevel = 1
+
+        app = web.Application()
+        app.router.add_post("/score", worker._handle_score)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        self.addAsyncCleanup(runner.cleanup)
+        await web.TCPSite(runner, "127.0.0.1", 0).start()
+        endpoint = TeacherEndpoint(
+            f"http://127.0.0.1:{runner.addresses[0][1]}", "default", backend.info
+        )
+        self.client = TeacherClient([endpoint])
+        self.addAsyncCleanup(self.client.close)
+
+    async def test_student_selected_ids_survive_http_roundtrip(self):
+        result = await self.client.score(request(2, ((0, 0), (4, 0), (2, 3))))
+        self.assertEqual(result.token_ids[1:].tolist(), [[4, 0], [2, 3]])
+        self.assertEqual(result.valid_mask.tolist(), [False, True, True])
+        torch.testing.assert_close(result.logprobs[1:], torch.full((2, 2), -2.0))
+
+    async def test_mismatched_scoring_ids_are_rejected_over_http(self):
+        from aiohttp import ClientResponseError
+
+        self.engine.reverse_ids = True
+        with self.assertRaises(ClientResponseError) as caught:
+            await self.client.score(request(2, ((0, 0), (4, 0), (2, 3))))
+        self.assertEqual(caught.exception.status, 400)
+
+
 @unittest.skipUnless(
     os.environ.get("RLINF_TEST_TEACHER_MODEL"),
     "Set RLINF_TEST_TEACHER_MODEL to enable a real Teacher engine test",

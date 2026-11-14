@@ -103,7 +103,7 @@ class SGLangTeacherBackend(TeacherScoringBackend):
                 rows.append(None)
                 continue
             actual_ids = tuple(int(item[1]) for item in row)
-            if actual_ids != request.selected_token_ids[position]:
+            if actual_ids != tuple(request.selected_token_ids[position]):
                 raise ValueError(
                     f"Teacher request {request.request_id}: per-position scoring IDs differ at position {position}"
                 )

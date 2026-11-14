@@ -125,6 +125,8 @@ placement 的 key 为 ``teacher_<model key>``。所需 GPU 总数等于 ``num_re
 
 设置 ``use_policy_gradient: true`` 后，蒸馏信号用于 policy-gradient 目标。此时采样参数要求 ``do_sample: true``、``temperature: 1.0``、``top_p: 1.0``、``top_k: -1`` （或 ``0``）以及 ``repetition_penalty: 1.0``。使用 SGLang rollout 时，还需检查 ``rollout.sampling_params`` 中的覆盖值。Teacher 始终对原始模型概率评分。
 
+Policy-gradient 训练还需获取旧 Student 的 logprob。设置 ``rollout.return_logprobs: true`` 可在生成时收集，设置 ``algorithm.recompute_logprobs: true`` 可在 Actor 更新前重新计算，两者至少开启一项。示例默认采用直接蒸馏，因此关闭了这两项。
+
 联合训练需设置 ``use_task_rewards: true``，并按 :doc:`reasoning` 配置任务奖励、advantage 和 PPO 参数。总目标为任务损失加上 ``distillation_loss_coef`` 倍的蒸馏损失；纯蒸馏模式的系数固定为 1。任务与 Teacher 的 mask 分别归一化。开启 ``algorithm.use_valid_token_scale`` 后，entropy 和 reference-KL 正则项也按任务的有效 token 加权。如果拒绝采样导致任一 Actor rank 的序列全部被过滤，所有 Actor rank 会共同跳过本轮更新，并记录 ``rollout/skipped_empty_batch``。
 
 运行

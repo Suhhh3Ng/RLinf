@@ -114,11 +114,17 @@ class InferenceHTTPClient:
         sampling_params: Optional[list[dict] | dict] = None,
         return_logprob: list[bool] | bool = False,
         image_data: Optional[list] = None,
+        top_logprobs_num: list[int] | int = 0,
     ) -> dict | list:
         return self.post(
             "/generate",
             self._generate_body(
-                prompt, input_ids, sampling_params, return_logprob, image_data
+                prompt,
+                input_ids,
+                sampling_params,
+                return_logprob,
+                image_data,
+                top_logprobs_num=top_logprobs_num,
             ),
         )
 
@@ -152,11 +158,17 @@ class InferenceHTTPClient:
         sampling_params: Optional[list[dict] | dict] = None,
         return_logprob: list[bool] | bool = False,
         image_data: Optional[list] = None,
+        top_logprobs_num: list[int] | int = 0,
     ) -> dict | list:
         return await self._apost(
             "/generate",
             self._generate_body(
-                prompt, input_ids, sampling_params, return_logprob, image_data
+                prompt,
+                input_ids,
+                sampling_params,
+                return_logprob,
+                image_data,
+                top_logprobs_num=top_logprobs_num,
             ),
         )
 
@@ -253,8 +265,12 @@ class InferenceHTTPClient:
         sampling_params: Optional[list[dict] | dict],
         return_logprob: list[bool] | bool,
         image_data: Optional[list] = None,
+        top_logprobs_num: list[int] | int = 0,
     ) -> dict:
-        body: dict = {"return_logprob": return_logprob}
+        body: dict = {
+            "return_logprob": return_logprob,
+            "top_logprobs_num": top_logprobs_num,
+        }
         if prompt is not None:
             body["text"] = prompt
         if input_ids is not None:
